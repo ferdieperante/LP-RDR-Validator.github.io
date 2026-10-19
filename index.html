@@ -6,6 +6,293 @@
     <meta name="description" content="RDR Desk: review, validate, annotate and export livestock and poultry statistics for the Negros Island Region." />
     <meta name="theme-color" content="#f5f4ee" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23687a39'/%3E%3Ctext x='32' y='45' font-family='system-ui,sans-serif' font-size='34' font-weight='800' text-anchor='middle' fill='%23fffdf7'%3ER%3C/text%3E%3C/svg%3E" />
+    <script id="rdr-nir-rollup-js">
+(function () {
+  /* NIR roll-up. When NIR has no value of its own, serve one computed from the provinces/cities below.
+     Computed values are never persisted: every write to the two keys strips untouched computed fields.
+     Bacolod City reports separately from Negros Occidental, so it is added to the regional total. */
+  var PROVS = ["Negros Occidental", "Bacolod City", "Negros Oriental", "Siquijor"];
+  var KE = "rdr3.edits",
+    KC = "rdr.import.components",
+    KCE = "rdr3.componentEdits",
+    LAYERS = ["household", "establishment"];
+  var rawGet = Storage.prototype.getItem,
+    rawSet = Storage.prototype.setItem;
+  var INFO = (window.__rdrNirInfo = {});
+  var RATE = { alw: 1, prevAlw: 1, eler: 1, cf: 1, days: 1, lpd: 1 };
+
+  function raw(k) {
+    try {
+      return rawGet.call(localStorage, k);
+    } catch (e) {
+      return null;
+    }
+  }
+  function parse(s) {
+    try {
+      var x = JSON.parse(s);
+      return x && typeof x === "object" ? x : {};
+    } catch (e) {
+      return {};
+    }
+  }
+  function num(v) {
+    if (v == null) return NaN;
+    var t = String(v).replace(/,/g, "").trim();
+    if (t === "") return NaN;
+    var n = Number(t);
+    return isFinite(n) ? n : NaN;
+  }
+  function fmt(n) {
+    return Number.isInteger(n) ? String(n) : String(+n.toFixed(2));
+  }
+  function hasData(rec) {
+    if (!rec || typeof rec !== "object") return false;
+    for (var f in rec) if (f.charAt(0) !== "_" && String(rec[f]).trim() !== "") return true;
+    return false;
+  }
+
+  /* roll up a list of {rec} for one commodity/quarter (or one layer) */
+  function roll(list) {
+    var out = {},
+      keys = {},
+      egg = false;
+    list.forEach(function (x) {
+      for (var f in x.rec) {
+        if (f.charAt(0) !== "_") keys[f] = 1;
+      }
+      if (hasVal(x.rec, "lf") || hasVal(x.rec, "pcs")) egg = true;
+    });
+    function hasVal(r, f) {
+      return isFinite(num(r[f]));
+    }
+    var g = function (r, k) {
+      var n = num(r[k]);
+      return isFinite(n) ? n : 0;
+    };
+    var prodHd = function (r) {
+      if (!hasVal(r, "beg") || !hasVal(r, "end")) return NaN;
+      return g(r, "beg") + g(r, "rec") + g(r, "born") + g(r, "shipIn") - g(r, "deaths") - g(r, "other") - g(r, "end");
+    };
+    var birds = function (r) {
+      return g(r, "lf") + g(r, "rtl");
+    };
+    var animals = function (r) {
+      return g(r, "ml");
+    };
+    function wavg(f, w) {
+      var sw = 0,
+        sx = 0,
+        n = 0,
+        sum = 0;
+      list.forEach(function (x) {
+        var v = num(x.rec[f]);
+        if (!isFinite(v)) return;
+        n++;
+        sum += v;
+        var wi = w(x.rec);
+        if (isFinite(wi) && wi > 0) {
+          sw += wi;
+          sx += wi * v;
+        }
+      });
+      if (!n) return null;
+      return sw > 0 ? sx / sw : sum / n;
+    }
+    for (var f in keys) {
+      if (RATE[f]) continue;
+      var s = 0,
+        seen = 0;
+      list.forEach(function (x) {
+        var n = num(x.rec[f]);
+        if (isFinite(n)) {
+          s += n;
+          seen++;
+        }
+      });
+      if (seen) out[f] = fmt(s);
+    }
+    var v;
+    if (keys.alw && (v = wavg("alw", prodHd)) != null) out.alw = fmt(v);
+    if (keys.prevAlw && (v = wavg("prevAlw", function (r) { return num(r.prevProd); })) != null) out.prevAlw = fmt(v);
+    var wDays = egg ? birds : animals;
+    if (keys.eler && (v = wavg("eler", birds)) != null) out.eler = fmt(v);
+    if (keys.lpd && (v = wavg("lpd", animals)) != null) out.lpd = fmt(v);
+    if (keys.days && (v = wavg("days", wDays)) != null) out.days = String(Math.round(v));
+    if (keys.cf) {
+      var p = 0,
+        mt = 0;
+      list.forEach(function (x) {
+        var pc = num(x.rec.pcs),
+          cf = num(x.rec.cf);
+        if (isFinite(pc) && isFinite(cf) && cf > 0) {
+          p += pc;
+          mt += pc / cf;
+        }
+      });
+      if (p > 0 && mt > 0) out.cf = fmt(p / mt);
+    }
+    return out;
+  }
+
+  /* overlay explicit fields on computed ones; remember which fields are still computed */
+  function overlay(computed, explicit) {
+    var ex = explicit && typeof explicit === "object" ? Object.assign({}, explicit) : {};
+    unmark(ex); /* a stale marker (e.g. from a restored backup) must never override the fresh one */
+    var merged = {},
+      mark = {},
+      any = false;
+    for (var f in computed) {
+      if (Object.prototype.hasOwnProperty.call(ex, f) && f.charAt(0) !== "_") continue;
+      merged[f] = computed[f];
+      mark[f] = computed[f];
+      any = true;
+    }
+    for (var e in ex) merged[e] = ex[e];
+    if (any) merged.__nir = JSON.stringify(mark);
+    return merged;
+  }
+  function unmark(rec) {
+    if (!rec || typeof rec !== "object" || rec.__nir === undefined) return false;
+    var mark = parse(rec.__nir);
+    for (var f in mark) if (String(rec[f]) === String(mark[f])) delete rec[f];
+    delete rec.__nir;
+    return true;
+  }
+
+  var cacheE = { i: null, o: null },
+    cacheC = { i: null, o: null };
+
+  function applyEdits(E) {
+    var groups = {},
+      info = {};
+    Object.keys(E).forEach(function (k) {
+      var p = k.split("|");
+      if (p.length !== 3 || PROVS.indexOf(p[1]) < 0 || !hasData(E[k])) return;
+      var g = p[0] + "|" + p[2];
+      (groups[g] = groups[g] || []).push({ prov: p[1], rec: E[k] });
+    });
+    Object.keys(groups).forEach(function (g) {
+      var i = g.indexOf("|"),
+        ck = g.slice(0, i),
+        q = g.slice(i + 1),
+        nk = ck + "|NIR|" + q,
+        list = groups[g],
+        have = list.map(function (x) { return x.prov; });
+      E[nk] = overlay(roll(list), E[nk]);
+      info[nk] = { have: have, missing: PROVS.filter(function (p) { return have.indexOf(p) < 0; }) };
+    });
+    return { E: E, info: info };
+  }
+  /* for in-memory state updates (e.g. "Reset to workbook"): recompute NIR on a plain edits object */
+  window.__rdrNirApply = function (E) {
+    try {
+      return applyEdits(JSON.parse(JSON.stringify(E || {}))).E;
+    } catch (e) {
+      return E;
+    }
+  };
+
+  function derivedEdits(rawE) {
+    if (rawE == null) return null;
+    if (cacheE.i === rawE) return cacheE.o;
+    var r = applyEdits(parse(rawE));
+    cacheE.i = rawE;
+    cacheE.o = JSON.stringify(r.E);
+    for (var k in INFO) delete INFO[k];
+    for (var n in r.info) INFO[n] = r.info[n];
+    return cacheE.o;
+  }
+
+  function derivedComps(rawC) {
+    if (rawC == null) return null;
+    var rawE = raw(KE),
+      rawCE = raw(KCE),
+      sig = rawC + "\u0001" + rawE + "\u0001" + rawCE;
+    if (cacheC.i === sig) return cacheC.o;
+    var C = parse(rawC),
+      CE = parse(rawCE),
+      E = parse(rawE),
+      groups = {},
+      totalProvs = {};
+    Object.keys(E).forEach(function (k) {
+      var p = k.split("|");
+      if (p.length === 3 && PROVS.indexOf(p[1]) >= 0 && hasData(E[k])) (totalProvs[p[0] + "|" + p[2]] = totalProvs[p[0] + "|" + p[2]] || []).push(p[1]);
+    });
+    Object.keys(C).concat(Object.keys(CE)).forEach(function (k) {
+      var p = k.split("|");
+      if (p.length !== 3 || PROVS.indexOf(p[1]) < 0) return;
+      var g = p[0] + "|" + p[2],
+        merged = {},
+        ok = true;
+      LAYERS.forEach(function (L) {
+        merged[L] = Object.assign({}, C[k] && C[k][L], CE[k] && CE[k][L]);
+        if (!hasData(merged[L])) ok = false;
+      });
+      if (!ok) return;
+      var list = (groups[g] = groups[g] || []);
+      if (!list.some(function (x) { return x.prov === p[1]; })) list.push({ prov: p[1], parts: merged });
+    });
+    Object.keys(groups).forEach(function (g) {
+      var list = groups[g],
+        have = list.map(function (x) { return x.prov; }),
+        tp = totalProvs[g] || [];
+      /* only when every province that contributes to the Total also has Household and Establishment values,
+         otherwise H + E would be compared with a Total it cannot match */
+      if (!tp.every(function (p) { return have.indexOf(p) >= 0; })) return;
+      var i = g.indexOf("|"),
+        nk = g.slice(0, i) + "|NIR|" + g.slice(i + 1),
+        rec = Object.assign({}, C[nk]);
+      LAYERS.forEach(function (L) {
+        rec[L] = overlay(roll(list.map(function (x) { return { rec: x.parts[L] }; })), C[nk] && C[nk][L]);
+      });
+      C[nk] = rec;
+    });
+    cacheC.i = sig;
+    cacheC.o = JSON.stringify(C);
+    return cacheC.o;
+  }
+
+  Storage.prototype.getItem = function (k) {
+    var v = rawGet.apply(this, arguments);
+    if (this !== localStorage) return v;
+    try {
+      if (k === KE) return derivedEdits(v);
+      if (k === KC) return derivedComps(v);
+    } catch (e) {
+      if (window.console) console.warn("NIR roll-up skipped:", e);
+    }
+    return v;
+  };
+
+  Storage.prototype.setItem = function (k, v) {
+    if (this === localStorage && (k === KE || k === KC) && typeof v === "string" && v.indexOf("__nir") >= 0) {
+      try {
+        var X = parse(v),
+          changed = false;
+        Object.keys(X).forEach(function (key) {
+          if (key.indexOf("|NIR|") < 0) return;
+          var rec = X[key];
+          if (!rec || typeof rec !== "object") return;
+          if (k === KE) {
+            if (unmark(rec)) changed = true;
+            if (!Object.keys(rec).length) delete X[key];
+          } else {
+            LAYERS.forEach(function (L) {
+              if (unmark(rec[L])) changed = true;
+              if (rec[L] && !Object.keys(rec[L]).length) delete rec[L];
+            });
+            if (!Object.keys(rec).length) delete X[key];
+          }
+        });
+        if (changed) v = JSON.stringify(X);
+      } catch (e) {}
+    }
+    return rawSet.call(this, k, v);
+  };
+})();
+
+</script>
     <script id="rdr-egg-days-formula">
 window.__rdrEggLayingDays=function(o){
  const read=v=>v==null||String(v).trim()===''?NaN:Number(String(v).replace(/,/g,''));
@@ -4566,7 +4853,14 @@ video {
 }
 :root{color-scheme:light}body{margin:0;background:#f9fbf6}.bg-paper{background-color:#f9fbf6}.text-paper{color:#f9fbf6}.text-paper-70{color:#f9fbf6d6}.text-paper-80{color:#f9fbf6cc}.bg-paper-10{background-color:#f9fbf61a}.bg-paper-40{background-color:#f9fbf666}.border-paper-20{border-color:#f9fbf633}.bg-card{background-color:#fdfefb}.border-card{border-color:#fdfefb}.text-ink{color:#1f2a1b}.bg-ink{background-color:#1f2a1b}.border-ink{border-color:#1f2a1b}.text-ink-80{color:#1f2a1bcc}.border-ink-40{border-color:#1f2a1b66}.text-muted{color:#646d58}.bg-muted{background-color:#646d58}.border-line{border-color:#dfe3d2}.bg-line{background-color:#dfe3d2}.divide-line>*+*{border-color:#e9ecdf}.text-olive{color:#4c6216}.bg-olive{background-color:#4c6216}.border-olive{border-color:#4c6216}.bg-olive-10{background-color:#4c62161a}.bg-olive-15{background-color:#4c621626}.bg-olive-35{background-color:#4c621659}.hov-olive:hover{background-color:#4c62160d}.border-olive-40{border-color:#4c621666}.text-ochre{color:#f0c27a}.bg-ochre-soft{background-color:#f0c27a}.bg-ochre{background-color:#c88a2c}.text-rust{color:#9e4013}.bg-rust{background-color:#9e4013}.border-rust{border-color:#9e4013}.bg-rust-10{background-color:#9e40131a}.bg-brick{background-color:#b04948}.border-brick{border-color:#b04948}.bg-brick-10{background-color:#b049481a}.font-display{font-family:Bricolage Grotesque,system-ui,sans-serif}.font-mono{font-family:Inconsolata,ui-monospace,monospace;font-variant-numeric:tabular-nums}.font-serif{font-family:Lora,Georgia,serif}main{font-family:Bricolage Grotesque,system-ui,sans-serif}.cell{background:#fbe7c4;border:1.5px solid #e2b66a;color:#1f2a1b;outline:none;transition:box-shadow .15s,background .15s}.cell:hover{background:#f8ddb0}.cell:focus{background:#fff6e6;box-shadow:0 0 0 3px #c88a2c73;border-color:#c88a2c}.cell::placeholder{color:#b8955a}.hatch{background:repeating-linear-gradient(135deg,#b04948 0 6px,#f1a09d 6px 10px)}.tick{appearance:none;width:18px;height:18px;flex:none;border:2px solid #4c6216;border-radius:5px;display:grid;place-content:center;cursor:pointer}.tick:checked{background:#4c6216}.tick:checked:after{content:"";width:9px;height:5px;border-left:2px solid #fff;border-bottom:2px solid #fff;transform:rotate(-45deg) translate(1px,-1px)}.tick:focus-visible{box-shadow:0 0 0 3px #4c621659}button:focus-visible,input:focus-visible{outline:2px solid #c88a2c;outline-offset:2px}.text-brick{color:#b04948}
 </style>
-  </head>
+  <style id="rdr-sheet-styled-css">
+.rdr-sheet-grid.styled{border-collapse:collapse;border-spacing:0;min-width:0;zoom:var(--rdr-sheet-scale);line-height:1.25}
+.rdr-sheet-grid.styled td{min-width:0;max-width:none;height:auto;padding:0 3px;box-sizing:border-box;border:0;text-overflow:clip}
+.rdr-sheet-grid.styled th{min-width:0;max-width:none;border:0;box-shadow:inset -1px -1px 0 #d9d9d9;padding:0 4px;font:600 12px Arial,Helvetica,sans-serif;height:20px}
+.rdr-sheet-grid.styled thead th{height:22px}
+.rdr-sheet-grid.styled .row-head{width:48px;min-width:48px;max-width:48px;font-weight:500}
+</style>
+</head>
   <body>
     <div id="root"></div>
     <script>window.__artifactSourceMap={"sources":["src/App.jsx","src/data.js","src/nir.json","src/calc.js"],"mappings":";;;;;;;;20m.0.e,17..;;;;;;;;pna.1.2,8.1.3,43.1.4,40.1.5,3s.1.6,3s.1.7,2c.1.8,1i.1.9,1a.1.a,17.1.b,12.1.c,3.1.d,21.1.e,3a.1.f,39.1.g,3o.1.h,2x.1.i,3.1.j,1s.1.k,1r.1.l,22.1.m,3.1.n,3i.1.o,2g.1.p,2r.1.q,23.1.r,2c.1.s,21.1.t,20.1.u,2.1.w,4.1.x,v.1.y,2j.1.z,1x.1.10,22.1.11,1r.1.12,1h.1.13,1d.1.14,3.1.15,13.1.16,x.1.17,1n.1.18,1s.1.19,1k.1.1a,1m.1.1b,c.1.1c,3.1.1d,v.1.1e,2c.1.1f,23.1.1g,2b.1.1h,1j.1.1i,3.1.1j,u.1.1k,1i.1.1l,t.1.1m,1m.1.1n,2.1.1o,2.1.1q,4.1.1r,14.1.1s,12.1.1t,1c.1.1u,1j.1.1v,18.1.1w,1n.1.1x,2.1.1z,1o.1.20,k.2.1,ed7.3.1,d.3.2,17.3.3,1c.3.4,v.3.5,2.3.1,7.3.6,1h.3.7,d.3.8,2w.3.7,7.3.9,x.3.a,14.3.c,h.3.d,1g.3.e,1c.3.f,a.3.g,e.3.h,6.3.i,c.3.j,c.3.k,x.3.l,b.3.m,6.3.n,1d.3.o,1h.3.p,7.3.q,37.3.r,1n.3.s,1e.3.t,1f.3.u,1.3.v,1.3.c,i.3.x,16.3.z,j.3.10,9.3.11,o.3.12,g.3.13,3e.3.14,2n.3.15,36.3.16,58.3.17,24.3.18,1t.3.19,43.3.1b,6o.3.1c,3g.3.1e,2u.3.1f,2h.3.1g,5v.3.1i,2t.3.1j,45.3.1k,5e.3.1m,45.3.1n,25.3.1o,2y.3.1p,3r.3.1q,21.3.1r,4b.3.1t,4g.3.1u,2t.3.1v,2b.3.1w,69.3.1y,2o.3.22,3.3.1z,2d.3.20,45.3.21,6b.3.22,u.3.23,o.3.24,5a.3.25,1.3.26,1v.3.27,t.3.28,6u.3.29,1.3.2b,p.3.2c,1i.3.2d,l.3.2e,1o.3.2f,3x.3.2g,82.3.2h,1.3.2p,3.3.2i,g.3.2j,6n.3.2k,8b.3.2l,3n.3.2n,88.3.2p,1f.3.2q,1m.3.2r,47.3.2s,48.3.2t,1.3.2u,31.3.2v,53.3.2w,1.3.2x,1.3.z,k.3.2z,h.3.30,2h.3.31,1c.3.32,t.3.33,o.3.34,g.3.35,38.3.36,1.3.2z,k.3.38,j.3.39,9.3.3a,q.3.3b,2e.3.3c,3y.3.3d,32.3.3e,2n.3.3f,2f.3.3g,48.3.3h,2w.3.3i,1z.3.3j,2o.3.3k,3j.3.3l,4r.3.3m,39.3.3n,4m.3.3o,1.3.3p,1.3.38,n.3.3r,f.3.3s,1r.3.3t,v.3.3u,25.3.3v,1.3.3r,l.3.3w,j.3.3x,9.3.3y,p.3.3z,30.3.40,2a.3.41,3o.3.42,4d.3.43,3w.3.44,4x.3.45,26.3.46,1.3.47,1.3.3w,p.0.t,e.0.l,2p.0.m,24.0.p,e.0.q,v.0.r,9.0.s,1n.0.t,6f.0.u,1z.0.v,3g.0.w,s.0.x,4m.0.y,3t.0.z,5.0.10,2i.0.11,2h.0.12,1y.0.13,4a.0.14,4o.0.15,1f.0.12,1.0.16,1.0.17,2.0.18,3.0.19,2.0.1a,5.0.1b,n.0.1c,3g.0.1d,11.0.1e,s.0.1f,v.0.1c,1.0.1g,2.0.1h,5.0.1i,aa.0.1k,3.0.1l,1.0.1n,1.0.p,c.0.1q,i.0.1r,14.0.1s,5o.0.1t,4i.0.1u,1p.0.1v,j.0.1w,x.0.1x,f.0.1y,3w.0.1z,k.0.20,t.0.21,15.0.22,2g.0.23,1.0.24,1.0.25,16.0.26,12.0.27,1.0.1v,g.0.28,22.0.2a,h.0.2b,27.0.2c,27.0.2d,e.0.2e,1d.0.2f,1.0.2a,h.0.2h,e.0.2i,1j.0.2j,1a.0.2k,1d.0.2l,19.0.2m,1e.0.2n,17.0.2o,18.0.2p,18.0.2q,15.0.2r,16.0.2s,y.0.2t,d.0.2u,d.0.2v,16.0.2w,24.0.2v,b.0.2x,7.0.2y,c.0.2z,1l.0.30,1j.0.31,14.0.32,13.0.33,11.0.34,d.0.35,h.0.36,3n.0.37,3.0.38,12.0.39,o.0.3a,1b.0.3b,m.0.3c,2p.0.3d,t.0.3e,1z.0.3f,5k.0.3e,2.0.3f,1.0.3g,2.0.3h,2.0.3b,7.0.3k,9.0.3l,1s.0.3m,2s.0.3n,m.0.3o,2g.0.3p,5x.0.3q,3h.0.3r,3n.0.3o,4.0.3s,1.0.3t,2.0.3u,5.0.3w,1v.0.3x,1b.0.3y,32.0.3z,2c.0.40,z.0.41,1y.0.42,5e.0.43,4u.0.44,3c.0.45,13.0.46,41.0.47,3q.0.48,3o.0.49,4.0.41,1.0.4b,1.0.4c,2.0.4d,3.0.4e,5.0.4g,2g.0.4h,2g.0.4i,2a.0.4j,3o.0.4k,71.0.4l,5.0.4m,1y.0.4n,5b.0.4o,2x.0.4p,2.0.4q,3h.0.4r,5.0.4t,y.0.4u,e.0.4v,k.0.4w,35.0.4x,1u.0.4y,1r.0.4z,1n.0.50,1m.0.51,5.0.52,1l.0.53,1z.0.54,5.0.55,16.0.56,y.0.57,1z.0.58,2.0.59,3.0.5a,5.0.5c,2h.0.5d,4y.0.5e,3w.0.5f,l.0.5g,1m.0.5h,1x.0.5i,1k.0.5j,2w.0.5k,2.0.5l,6.0.5m,2.0.5o,3.0.5p,3.0.5q,1.0.5s,1.0.2h,f.0.5u,h.0.5v,3b.0.5w,2k.0.5x,3f.0.5y,1.0.5u,i.0.60,z.0.61,19.0.62,9.0.63,k.0.64,1f.0.65,22.0.66,1p.0.67,1u.0.68,2c.0.69,21.0.6a,5.0.6b,w.0.6c,21.0.6d,2e.0.6e,20.0.6f,28.0.6g,5.0.6h,z.0.6i,1z.0.6j,2w.0.6k,5.0.6l,v.0.6m,2g.0.6n,2f.0.6o,20.0.6p,5.0.6q,z.0.6r,25.0.6s,2c.0.6t,2b.0.6u,2a.0.6v,2q.0.6w,1w.0.6x,21.0.6y,1x.0.6z,3.0.70,1.0.72,1.0.60,h.0.74,t.0.75,9.0.76,k.0.77,18.0.78,24.0.79,1q.0.7a,1p.0.7b,1k.0.7c,5.0.7d,v.0.7e,25.0.7f,26.0.7g,21.0.7h,2c.0.7i,1p.0.7j,3.0.7k,1.0.7m,1.0.74,i.0.7o,n.0.7p,q.0.7q,1u.0.7r,9.0.7s,1s.0.7t,4s.0.7u,1r.0.7v,5k.0.7w,2q.0.7x,5.0.7y,1y.0.7z,5r.0.80,39.0.81,5.0.82,5o.0.83,1.0.85,1.0.7o,g.0.87,t.0.88,9.0.89,k.0.8a,12.0.8b,29.0.8c,1k.0.8d,1q.0.8e,5.0.8f,p.0.8g,2m.0.8h,1m.0.8i,1p.0.8j,3.0.8k,1.0.8m,1.0.87,k.0.8o,n.0.8p,1n.0.8q,9.0.8r,1s.0.8s,4m.0.8t,1r.0.8u,3c.0.8v,27.0.8w,5.0.8x,1y.0.8y,4i.0.8z,38.0.90,5.0.91,40.0.92,1.0.94,1.0.8o,i.0.96,v.0.97,9.0.98,f.0.99,3n.0.9a,2g.0.9b,1.0.9d,1.0.96,d.0.9f,16.0.9g,9.0.9h,w.0.9i,2v.0.9j,3b.0.9k,2j.0.9l,5.0.9m,1p.0.9n,1.0.9p,1.0.9f,e.0.9r,1a.0.9s,t.0.9t,b.0.9u,8.0.9v,1x.0.9w,b.0.9x,9.0.9y,22.0.9z,2t.0.a0,1t.0.a1,z.0.a2,1l.0.a3,34.0.a4,1.0.a6,1.0.9r,c.0.a8,1c.0.a9,9.0.aa,22.0.ab,2o.0.ac,1i.0.ad,3w.0.ae,h.0.ac,c.0.af,3.0.ag,1.0.ai,1.0.a8,g.0.ak,8.0.al,14.0.am,1c.0.an,1a.0.ao,17.0.ap,1g.0.aq,1a.0.ar,2.0.at,j.0.au,t.0.av,k.0.aw,i.0.ax,1v.0.ay,14.0.az,l.0.b0,l.0.b1,g.0.b2,9.0.b3,1s.0.b4,2k.0.b5,4c.0.b6,2v.0.b7,1e.0.b8,3.0.b9,5.0.ba,21.0.bb,2n.0.bc,2t.0.bd,5.0.be,1a.0.bf,3j.0.bg,26.0.bh,m.0.bi,38.0.bj,3d.0.bi,3.0.bj,1.0.bk,2.0.bl,2.0.bm,8.0.bn,4b.0.bp,3z.0.bq,5.0.br,29.0.bs,m.0.bt,27.0.bu,6s.0.bv,22.0.bt,3.0.bw,1.0.bx,2.0.by,3.0.bz,1.0.c1,1.0.at,i.0.c3,y.0.c5,9.0.c6,38.0.c4,w.0.c6,15.0.c7,2g.0.c8,1.0.ca,1.0.c3,e.0.cc,j.0.cd,h.0.ce,9.0.cf,a.0.cg,l.0.ch,11.0.ci,p.0.cj,u.0.ck,2k.0.cl,e.0.cm,9.0.cn,23.0.co,2a.0.cp,3i.0.cq,37.0.cr,5.0.cs,1u.0.ct,3n.0.cu,7o.0.cv,5.0.cw,2g.0.cx,2y.0.cy,5.0.cz,40.0.d0,1.0.d2,1.0.cc,d.0.d4,j.0.d5,3n.0.d6,1n.0.d7,23.0.d8,9.0.d9,4c.0.da,41.0.db,z.0.dc,34.0.dd,2e.0.de,3f.0.df,c.0.dg,1u.0.dh,4z.0.di,3.0.dk,3.0.dl,1.0.dn,1.0.d4,d.0.dp,16.0.dq,t.0.dr,u.0.ds;0.0.ds;0.0.ds;0.0.ds,3.0.dr,8.0.e0,9.0.e1,13.0.dt,c.0.du,a.0.dv,1d.0.dw,3x.0.dx,1.0.dy,w.0.dz,2.0.dt,8.0.e1,41.0.e2,18.0.e3,1.0.e5,1.0.dp,i.0.e8,32.0.e9,1e.0.ea,1o.0.eb,z.0.ec,e.0.ed,1c.0.ee,j.0.ef,1s.0.eg,9.0.eh,1s.0.ei,2f.0.ej,s.0.ek,4j.0.el,4e.0.em,5.0.en,2m.0.eo,m.0.ep,1x.0.eq,45.0.ep,1.0.eq,1.0.er,2.0.es,3.0.et,5.0.eu,2j.0.ev,26.0.ew,t.0.ex,1o.0.ey,41.0.ez,5o.0.f0,2.0.f1,5.0.f2,g.0.f3,l.0.f5,1r.0.f6,4d.0.f7,1k.0.f5,1.0.f8,1.0.fa,2.0.fb,3.0.fc,2.0.fd,5.0.fe,1m.0.ff,5i.0.fg,69.0.fh,3.0.fi,1.0.fk,1.0.ec,m.0.fl,q.0.fm,1g.0.fn,m.0.fo,12.0.fp,i.0.fq,9.0.fr,27.0.fs,2m.0.ft,32.0.fu,29.0.fv,3.0.fw,1.0.fy,1.0.fl,e.0.g1,e.0.g2,1g.0.g3,15.0.g4,t.0.g5,r.0.g6,9.0.g7,1r.0.g8,2d.0.g9,s.0.ga,25.0.gb,41.0.gc,2p.0.gd,5.0.ge,20.0.gf,2m.0.gg,5.0.gh,1l.0.gi,m.0.gj,23.0.gk,3k.0.gl,u.0.gm,r.0.gn,d.0.go,2t.0.gp,3j.0.gq,2v.0.gr,3.0.gn,1.0.gs,1.0.gt,2.0.gu,4.0.gj,7.0.gv,1.0.gw,2.0.gx,5.0.gy,50.0.gz,5.0.h0,20.0.h1,41.0.h2,u.0.h3,q.0.h4,2a.0.h5,3j.0.h6,2g.0.h7,2k.0.h4,3.0.h8,1.0.h9,2.0.ha,5.0.hb,55.0.hc,3.0.hd,2.0.he,1.0.hg,1.0.g1,m..","probe":8}</script>
@@ -4858,7 +5152,7 @@ window.__rdrMergedParts=rdrMergedParts;window.__rdrAggregatePair=rdrAggregatePai
 function rdFix(C){return{...C,fixes:(C.level==="flag"||C.level==="error")&&window.__rdrFixes?window.__rdrFixes(C.id):null}}
 function rdFixBtns(fx){return fx&&fx.length?(0,h.jsx)("div",{className:"rdr-fixrow",children:fx.map(f=>(0,h.jsx)("button",{type:"button",className:"rdr-fixbtn",title:f.title||f.label,onClick:()=>window.__rdrDraft.setFields(f.fields),children:f.label},f.label))}):null}
 function rdrMerge(a,b){const o={...(a||{})};for(const k in (b||{})){const x=b[k];o[k]=x&&typeof x==="object"&&!Array.isArray(x)?rdrMerge(a?.[k],x):x}return o}
-function Uk(){let[e,t0]=(0,me.useState)(()=>Mr("rdr4.cid","carabao")),[n,r0]=(0,me.useState)(()=>Mr("rdr4.subs",{})),[o,s0]=(0,me.useState)(()=>Mr("rdr3.prov","NIR")),[a,l0]=(0,me.useState)(()=>Mr("rdr2.q","Q3")),[u0,c]=(0,me.useState)(()=>Mr("rdr3.edits",{})),[rdDr,setRdDr]=(0,me.useState)({}),[rdPd,setRdPd]=(0,me.useState)({}),[rdRev,setRdRev]=(0,me.useState)(0),[srcParts,setSrcParts]=(0,me.useState)(()=>Mr("rdr.import.components",{})),[pe0,setPartEdits]=(0,me.useState)(()=>Mr("rdr3.componentEdits",{})),[layer,setLayer0]=(0,me.useState)(()=>Mr("rdr.view.layer","total")),[output,setOutput]=(0,me.useState)("review");const u=(0,me.useMemo)(()=>rdrMerge(u0,rdDr),[u0,rdDr]),partEdits=(0,me.useMemo)(()=>rdrMerge(pe0,rdPd),[pe0,rdPd]),rdDirty=Object.keys(rdDr).length>0||Object.keys(rdPd).length>0,rdGuard=fn=>{window.__rdrDirty&&window.__rdrConfirm?window.__rdrConfirm(fn):fn()},t=x=>rdGuard(()=>t0(x)),r=x=>rdGuard(()=>r0(x)),s=x=>rdGuard(()=>s0(x)),l=x=>rdGuard(()=>l0(x)),setLayer=x=>rdGuard(()=>setLayer0(x));window.__rdrDirty=rdDirty;window.__rdrLive={"rdr3.edits":rdDr,"rdr3.componentEdits":rdPd};window.__rdrDraft={count:()=>Object.values(rdDr).reduce((a,o)=>a+Object.keys(o).length,0)+Object.values(rdPd).reduce((a,o)=>a+Object.values(o).reduce((b,x)=>b+Object.keys(x).length,0),0),accept:()=>{const nu=rdrMerge(u0,rdDr),np=rdrMerge(pe0,rdPd);try{localStorage.setItem("rdr3.edits",JSON.stringify(nu));localStorage.setItem("rdr3.componentEdits",JSON.stringify(np))}catch{window.alert("Changes could not be saved in this browser. Your draft is still open. Free browser storage or export a backup before closing.");return false}c(nu);setPartEdits(np);setRdDr({});setRdPd({});setTimeout(()=>setRdRev(n=>n+1),60);return true},discard:()=>{setRdDr({});setRdPd({});setRdRev(n=>n+1)},setFields:o=>{for(const k in o)P(k,String(o[k]))},setPart:(k,L,f,v)=>setRdPd(j=>({...j,[k]:{...j[k]||{},[L]:{...j[k]?.[L]||{},[f]:v}}}))};(0,me.useEffect)(()=>{window.dispatchEvent(new Event("rdr-draft"))},[rdDr,rdPd]);(0,me.useEffect)(()=>_o("rdr4.cid",e),[e]),(0,me.useEffect)(()=>_o("rdr4.subs",n),[n]),(0,me.useEffect)(()=>_o("rdr3.prov",o),[o]),(0,me.useEffect)(()=>_o("rdr2.q",a),[a]),(0,me.useEffect)(()=>_o("rdr3.edits",u0),[u0]),(0,me.useEffect)(()=>_o("rdr3.componentEdits",pe0),[pe0]),(0,me.useEffect)(()=>_o("rdr.view.layer",layer),[layer]);let f=du.find(C=>C.id===e)||du[0],d=jk(f,n[e]),m=Bk(f,n[e]),x=i(C=>{const K=rm(m,C,a),seed=zk(d,C,a,m),parts=rdrMergedParts(K,srcParts,partEdits),base={...seed,...u[K]||{}};if(layer==="household"||layer==="establishment")return parts?.[layer]?{...parts[layer],_blanks:[]}:{_blanks:[]};return{...base,_blanks:$k(d,C,a,m).filter(M=>u[rm(m,M.prov||C,a)]?.[M.key||_k[M.field]]===void 0)}},"valsFor"),priorFor=C=>{const qi=nm.indexOf(a);if(qi<=0)return null;const pq=nm[qi-1],pk=rm(m,C,pq);if(layer==="total")return {...zk(d,C,pq,m),...(u[pk]||{})};return rdrMergedParts(pk,srcParts,partEdits)?.[layer]||null},v=x(o),S=rm(m,o,a),partsNow=rdrMergedParts(S,srcParts,partEdits),hasParts=!!(partsNow?.household&&partsNow?.establishment),totalRecon=rdrTotalMismatches(v,partsNow,d),totalMismatches=totalRecon.filter(M=>M.status==="mismatch"),totalIncomplete=totalRecon.filter(M=>M.status==="incomplete"),P=i((C,M)=>{if(d.kind==="egg"&&C==="days"&&String(M).trim()!==""&&Number.isFinite(Number(M)))M=String(Math.round(Number(M)));if((layer==="household"||layer==="establishment")&&partsNow?.[layer]){setRdPd(j=>({...j,[S]:{...j[S]||{},[layer]:{...j[S]?.[layer]||{},[C]:M}}}));setRdRev(n=>n+1);return}setRdDr(j=>({...j,[S]:{...j[S]||{},[C]:M}}));setRdRev(n=>n+1)},"set"),{r:g,checks:rdP1,has:y}=(0,me.useMemo)(()=>P1(d,v,a,priorFor(o),layer,partsNow,o),[d,v,a,u,srcParts,partEdits,layer]),rdShip=layer==="total"?totalMismatches.find(M=>M.field==="anticipatedShipOut"):null,rdShipInc=layer==="total"?totalIncomplete.find(M=>M.field==="anticipatedShipOut"):null,p=rdP1,w=p.filter(C=>C.level==="error").length,T=p.filter(C=>C.level==="flag").length,N=layer==="total"?!!u[S]&&Object.keys(u[S]).length>0:!!partEdits[S]?.[layer]&&Object.keys(partEdits[S][layer]).length>0,k=g1.map(C=>{let M=P1(d,x(C),a,priorFor(C),layer,rdrMergedParts(rm(m,C,a),srcParts,partEdits),C);return M.has?{p:C,e:M.checks.filter(j=>j.level==="error").length,f:M.checks.filter(j=>j.level==="flag").length}:{p:C,e:null,f:null}}),E=d.cd?ys.cdspdp[a]?.[d.cd]?.[o]:null,O=`${o} \xB7 ${a} ${Number(localStorage.getItem("rdr.year.current")||2026)}`,R=`${f.name}${f.subs?` \xB7 ${d.subName}`:""}`,A=i((C,M,j,Te,Un)=>(0,h.jsx)("div",{className:"flex flex-wrap rounded-[10px] bg-line p-1",role:"group","aria-label":Te,children:C.map(([ue,nt])=>(0,h.jsx)("button",{type:"button","aria-pressed":ue===M,onClick:()=>j(ue),className:`rounded-[7px] px-3 py-1.5 ${Un?"font-mono text-[16px] font-bold":"font-display text-[14px] font-semibold"} ${ue===M?"bg-card text-ink shadow-sm":"text-ink-80 hover:text-ink"}`,children:nt},ue))}),"seg");window.__rdrConsistency=rdP1.filter(C=>C.fields?.length);window.__rdrVals={key:S,year:Number(localStorage.getItem("rdr.year.current")||2026),cid:e,sub:m.split(":")[1]||"",prov:o,q:a,layer,kind:d.kind,has:y,v,parts:partsNow,total:layer==="total"?v:{...zk(d,o,a,m),...(u[S]||{})}};(0,me.useEffect)(()=>{window.dispatchEvent(new Event("rdr-vals"))},[JSON.stringify(v),S,layer,y]);return(0,h.jsxs)("section",{className:`rdr-commodity-workbench rdr-layer-${layer} mx-auto max-w-[1240px] px-6 pt-6`,"data-rdr-layer":layer,children:[(0,h.jsx)("div",{className:"flex flex-wrap gap-2",role:"tablist","aria-label":"Commodity",children:du.map(C=>(0,h.jsxs)("button",{type:"button",role:"tab","aria-selected":C.id===e,onClick:()=>t(C.id),className:`flex items-center gap-2 rounded-[10px] border-2 px-3 py-2 font-display text-[14px] font-semibold transition ${C.id===e?"border-ink bg-ink text-paper":"border-line bg-card text-ink hover:border-olive"}`,children:[(0,h.jsx)("span",{className:`font-mono text-[14px] ${C.id===e?"text-ochre":"text-muted"}`,children:C.code}),C.name,Object.keys(u).some(key=>key.startsWith(C.id+"|")||key.startsWith(C.id+":"))&&(0,h.jsx)("span",{className:`h-2 w-2 rounded-full ${C.id===e?"bg-ochre":"bg-olive"}`,title:"Workbook loaded"})]},C.id))}),(0,h.jsxs)("div",{className:"mt-4 flex flex-wrap items-stretch gap-3",children:[A(nm.map(C=>[C,C]),a,l,"Quarter",!0),f.subs&&A(f.subs.map(C=>[C.id,C.name]),d.id===f.id?n[e]||f.subs[0].id:null,C=>r(M=>({...M,[e]:C})),"Type"),A([["household","Household"],["establishment","Establishment"],["total","Total"]],layer,setLayer,"Source"),(0,h.jsx)("div",{className:"flex flex-wrap gap-2",role:"group","aria-label":"Province",children:k.map(({p:C,e:M,f:j})=>(0,h.jsxs)("button",{type:"button","aria-pressed":C===o,onClick:()=>s(C),className:`flex items-center gap-2 rounded-[10px] border-2 px-3 py-1.5 text-[14px] font-semibold transition ${C===o?"border-olive bg-olive text-paper":"border-line bg-card hover:border-olive"}`,children:[C==="NIR"?"NIR (region)":C,M===null?(0,h.jsx)("span",{className:`font-mono text-[14px] ${C===o?"text-paper":"text-muted"}`,children:"no data"}):(0,h.jsxs)("span",{className:"flex gap-1",children:[M>0&&(0,h.jsx)("span",{className:"rounded-full bg-brick px-1.5 font-mono text-[14px] font-bold leading-[20px] text-paper",children:M}),j>0&&(0,h.jsx)("span",{className:"rounded-full bg-rust px-1.5 font-mono text-[14px] font-bold leading-[20px] text-paper",children:j}),M===0&&j===0&&(0,h.jsx)("span",{className:`font-mono text-[14px] font-bold ${C===o?"text-paper":"text-olive"}`,children:"\u2713"})]})]},C))})]}),(0,h.jsxs)("div",{className:"rdr-output-bar",children:[(0,h.jsx)("div",{className:"rdr-output-tabs",role:"group","aria-label":"Commodity outputs",children:[["review","Review"],["sheet","Excel sheet"],["trends","Indicator trends"],["flow","Province flows"]].map(([id,label])=>(0,h.jsx)("button",{type:"button","aria-pressed":output===id,onClick:()=>setOutput(id),children:label},id))}),(0,h.jsx)("span",{className:"rdr-output-context",children:`${R} · ${o} · ${a} ${Number(localStorage.getItem("rdr.year.current")||2026)} · ${layer==="household"?"Household":layer==="establishment"?"Establishment":"Total"}`})]}),output==="trends"?(0,h.jsx)("section",{id:"rdr-ind-tab-host",className:"rdr-ind-tab-host","data-key":m,"data-province":o,"data-quarter":a,"data-year":Number(localStorage.getItem("rdr.year.current")||2026),"data-layer":layer},"trends:"+S+":"+layer):output==="flow"?(0,h.jsx)("section",{id:"rdr-flow-tab-host",className:"rdr-flow-tab-host","data-key":m,"data-province":o,"data-quarter":a,"data-year":Number(localStorage.getItem("rdr.year.current")||2026),"data-layer":layer},"flow:"+S+":"+layer):output==="sheet"?(0,h.jsx)("section",{id:"rdr-sheet-tab-host",className:"rdr-sheet-tab-host","data-key":m,"data-province":o,"data-quarter":a,"data-year":Number(localStorage.getItem("rdr.year.current")||2026),"data-layer":layer},"sheet:"+S+":"+layer):(0,h.jsxs)("div",{className:"mt-6 grid gap-6 lg:grid-cols-[minmax(0,420px)_minmax(0,1fr)]",children:[(0,h.jsxs)("div",{className:"rounded-[14px] border-2 border-line bg-card p-5",children:[(0,h.jsxs)("div",{className:"flex items-baseline justify-between gap-3",children:[(0,h.jsxs)("h2",{className:"font-display text-[22px] font-extrabold tracking-[-0.01em]",children:[R," \xB7 ",a," "+Number(localStorage.getItem("rdr.year.current")||2026)]}),N&&(0,h.jsx)("button",{type:"button",className:"shrink-0 font-display text-[14px] font-semibold text-rust underline-offset-4 hover:underline",onClick:()=>{setRdDr(D=>{const m={...D};delete m[S];return m});setRdPd(D=>{const m={...D};delete m[S];return m});setTimeout(()=>setRdRev(n=>n+1),60);if(layer==="total")c(C=>{let M={...C};return delete M[S],M});else setPartEdits(C=>{let M={...C},z={...(M[S]||{})};delete z[layer];Object.keys(z).length?M[S]=z:delete M[S];return M})},children:"Reset to workbook"})]}),(0,h.jsx)("p",{className:"mt-1 font-serif text-[14px] italic text-muted",children:(()=>{const src=Mr("rdr.import.history",{})[S]?.source;return src?`${o} · ${layer==="household"?"Household":layer==="establishment"?"Establishment":"Total"} · ${src.book} / ${src.sheet}, row ${src.row}`:`${o} · ${layer==="household"?"Household":layer==="establishment"?"Establishment":"Total"} · Enter estimates or import a workbook for this selection.`})()}),d.kind==="egg"?(0,h.jsx)(Gk,{v,set:P,r:g,P:d}):d.kind==="dairy"?(0,h.jsx)(Qk,{v,set:P,r:g}):(0,h.jsx)(Wk,{P:d,v,set:P,r:g,q:a,ship:rdShip,shipInc:rdShipInc}),(0,h.jsx)("section",{id:"rdr-bal-host",className:"rdr-bal-host"})]}),(0,h.jsx)("div",{className:"min-w-0",children:y?(0,h.jsxs)(h.Fragment,{children:[layer==="total"&&(hasParts||totalRecon.length>0)&&(0,h.jsxs)("div",{className:`rdr-total-recon ${totalMismatches.length?"warn":totalIncomplete.length?"incomplete":"ok"}`,children:[(0,h.jsx)("span",{className:"rdr-total-recon-eyebrow",children:"Total reconciliation"}),(0,h.jsx)("strong",{children:totalMismatches.length&&totalIncomplete.length?"Mismatches and incomplete inputs need review":totalMismatches.length?"Some Total cells do not equal Household + Establishment":totalIncomplete.length?"Some checks cannot be completed":"Household + Establishment reconciliation passed"}),(totalMismatches.length||totalIncomplete.length)>0&&(0,h.jsx)("span",{className:"rdr-total-recon-help",children:"Red = complete H/E/Total values disagree. Amber = one or more inputs needed for the comparison are blank."}),totalMismatches.length>0&&(0,h.jsxs)("div",{className:"rdr-total-recon-group",children:[(0,h.jsx)("b",{children:"Mismatch"}),(0,h.jsx)("div",{className:"rdr-total-recon-list",children:totalMismatches.map(M=>(0,h.jsxs)("span",{"data-field":M.field,"data-status":"mismatch",className:"rdr-total-recon-item mismatch",children:[M.label,": H + E = ",L(M.expected)," · Total = ",L(M.total)," · difference ",M.diff>0?"+":"",L(M.diff)]},"m-"+M.field))})]}),totalIncomplete.length>0&&(0,h.jsxs)("div",{className:"rdr-total-recon-group",children:[(0,h.jsx)("b",{children:"Incomplete inputs"}),(0,h.jsx)("div",{className:"rdr-total-recon-list",children:totalIncomplete.map(M=>(0,h.jsxs)("span",{"data-field":M.field,"data-status":"incomplete",className:"rdr-total-recon-item incomplete",children:[M.label,": cannot compare H + E with Total · incomplete ",M.missing.join(" + "),M.derived?" inputs":""]},"i-"+M.field))})]}),totalRecon.length===0&&(0,h.jsx)("span",{children:"All additive cells with complete Household, Establishment, and Total inputs reconcile."})]}),d.kind==="egg"?(0,h.jsx)(Kk,{P:d,r:g}):d.kind==="dairy"?(0,h.jsx)(qk,{P:d,r:g}):(0,h.jsx)(Yk,{r:g}),(0,h.jsxs)("div",{className:"mt-6 flex flex-wrap items-center gap-3",children:[(0,h.jsx)(C1,{n:w,label:"must fix",tone:"brick"}),(0,h.jsx)(C1,{n:T,label:"need an NRF reason",tone:"rust"}),(0,h.jsx)(Zk,{title:`${R}, ${O}`,summary:Hk(d,g),checks:p,ctx:layer==="total"?S:S+"|"+layer})]}),(0,h.jsx)(rdrCheckSections,{checks:p,ctx:layer==="total"?S:S+"|"+layer,layer})]}):(0,h.jsxs)("div",{className:"rounded-[14px] border-2 border-dashed border-line bg-card p-8",children:[(0,h.jsxs)("p",{className:"font-display text-[26px] font-extrabold leading-tight",children:["No ",layer==="household"?"household ":layer==="establishment"?"establishment ":"",R.toLowerCase()," figures for ",o==="NIR"?"the region":o," yet"]}),(0,h.jsx)("p",{className:"mt-2 text-[16px] text-muted",children:"Import S-D workbooks or type PSO estimates into the orange cells."}),(0,h.jsx)("button",{type:"button",className:"rdr-cta",onClick:()=>document.getElementById("rdr-import-launch")?.click(),children:"Import workbooks"}),E&&(E.y26||E.y25)?(0,h.jsxs)("div",{className:"mt-6 grid gap-4 sm:grid-cols-3",children:[(0,h.jsx)(om,{label:`CDSPDP ${a} ${Number(localStorage.getItem("rdr.year.current")||2026)}`,value:L(Number(localStorage.getItem("rdr.year.current")||2026)===2025?E.y25:E.y26)}),(0,h.jsx)(om,{label:`CDSPDP ${a} ${Number(localStorage.getItem("rdr.year.current")||2026)===2025?2026:2025}`,value:L(Number(localStorage.getItem("rdr.year.current")||2026)===2025?E.y26:E.y25)}),(0,h.jsx)(om,{label:"2026 vs 2025 growth",value:E.y25?`${E.y26>=E.y25?"+":""}${L((E.y26-E.y25)/E.y25*100,1)}%`:"new"})]}):null]})})]})]})}i(Uk,"SDView");function RdrProductSimulator({P,v,context,set:setDesk,layer="total",hasParts=false}){const egg=P.kind==="egg",readOnlyTotal=!1,layerLabel=layer==="household"?"Household":layer==="establishment"?"Establishment":"Total";const [scenario,setScenario]=(0,me.useState)(()=>egg?{eler:v.eler??"",pcs:v.pcs??"",days:v.days??92}:{...v});if(!egg){const fields=[["ml","Animals in milkline"],["lpd","Litres per animal per day"],["days","Days in quarter"]],calc=x=>Number(x.ml)>=0&&Number(x.lpd)>=0&&Number(x.days)>0?Number(x.ml)*Number(x.lpd)*Number(x.days):NaN,base=calc(v),value=calc(scenario),valid=fields.every(([key])=>scenario[key]!==""&&scenario[key]!=null&&Number(scenario[key])>=0)&&Number.isFinite(value);return (0,h.jsxs)("section",{className:"rdr-product-sim",children:[(0,h.jsx)("h2",{children:"Production simulator"}),(0,h.jsx)("p",{children:context+` · ${layerLabel}. Explore a scenario; imported estimates remain unchanged.`}),(0,h.jsx)("div",{className:"rdr-scenario-fields",children:fields.map(([key,label])=>(0,h.jsxs)("label",{children:[label,(0,h.jsx)("input",{type:"number",min:0,step:key==="lpd"?"any":1,value:scenario[key]??"",onChange:ev=>setScenario({...scenario,[key]:ev.target.value})})]},key))}),(0,h.jsxs)("div",{className:"rdr-scenario-results","aria-live":"polite",children:[(0,h.jsx)("p",{children:`Desk: ${Number.isFinite(base)?L(base,2):"—"} litres`}),(0,h.jsx)("strong",{children:valid?`Scenario: ${L(value,2)} litres`:"Enter valid values to calculate the scenario."}),(0,h.jsx)("p",{children:valid&&Number.isFinite(base)?`Change: ${L(value-base,2)} litres${base?` (${L((value/base-1)*100,2)}%)`:""}`:""})]}),(0,h.jsx)("button",{type:"button",onClick:()=>setScenario({...v}),children:"Reset scenario"})]})}const num=x=>x===""||x==null?NaN:Number(x),birds=Math.max(0,(Number(v.lf)||0)+(Number(v.rtl)||0)),eler=num(scenario.eler),pcs=num(scenario.pcs),days=num(scenario.days),expected=birds>0&&Number.isFinite(eler)&&eler>=0&&Number.isFinite(days)&&days>0?birds*(eler/100)*days:NaN,gap=Number.isFinite(expected)&&Number.isFinite(pcs)?pcs-expected:NaN,tol=Number.isFinite(expected)?Math.max(1,Math.abs(expected)*.005):NaN,balanced=Number.isFinite(gap)&&Math.abs(gap)<=tol,mt=Number(v.cf)>0&&Number.isFinite(pcs)?pcs/Number(v.cf)/1e3:NaN,baseExpected=birds>0&&Number(v.eler)>=0&&Number(v.days)>0?birds*(Number(v.eler)/100)*Number(v.days):NaN,baseGap=Number.isFinite(baseExpected)&&Number(v.pcs)>=0?Number(v.pcs)-baseExpected:NaN,round=(x,d=4)=>String(Math.round(x*10**d)/10**d),solve=key=>{if(key==="eler"){if(!(birds>0&&Number.isFinite(pcs)&&pcs>=0&&Number.isFinite(days)&&days>0))return;setScenario(x=>({...x,eler:round(pcs/(birds*days)*100,4)}))}else if(key==="pcs"){if(!(birds>0&&Number.isFinite(eler)&&eler>=0&&Number.isFinite(days)&&days>0))return;setScenario(x=>({...x,pcs:String(Math.round(birds*(eler/100)*days))}))}else if(key==="days"){const result=window.__rdrEggLayingDays({...v,pcs:scenario.pcs,eler:scenario.eler});if(!Number.isFinite(result))return;setScenario(x=>({...x,days:round(result,0)}))}},apply=()=>{if(!setDesk||readOnlyTotal)return;setDesk("eler",scenario.eler);setDesk("pcs",scenario.pcs);setDesk("days",scenario.days)},issues=[];birds<=0&&issues.push("No available laying flock is loaded, so the egg identity cannot be balanced."),Number.isFinite(eler)&&(eler<0||eler>100)&&issues.push("ELER must stay between 0% and 100%."),Number.isFinite(days)&&days>92&&issues.push("Required laying days exceed the desk's 92-day quarter limit."),P.eler&&Number.isFinite(eler)&&(eler<P.eler[0]||eler>P.eler[1])&&issues.push(`ELER is outside the ${P.eler[0]}–${P.eler[1]}% benchmark for this category.`);const fields=[["eler","ELER, %","0.01"],["pcs","Egg production, pieces","1"],["days","Laying days","1"]];return (0,h.jsxs)("section",{className:"rdr-product-sim rdr-egg-balancer",children:[(0,h.jsx)("h2",{children:"Egg balance simulator"}),(0,h.jsx)("p",{children:context+` · ${layerLabel}. Balance the egg identity using ELER, egg pieces, and laying days. Beginning laying flock and RTL received stay anchored to this source.`+(readOnlyTotal?" Total remains a separate reviewed value; H/E reconciliation is flagged in Review & checks.":"")}),(0,h.jsxs)("div",{className:"rdr-egg-anchor",children:[(0,h.jsxs)("span",{children:["Beginning laying flock: ",(0,h.jsx)("b",{children:L(Number(v.lf)||0)})]}),(0,h.jsxs)("span",{children:["RTL received: ",(0,h.jsx)("b",{children:L(Number(v.rtl)||0)})]}),(0,h.jsxs)("span",{children:["Available laying birds: ",(0,h.jsx)("b",{children:L(birds)})]})]}),(0,h.jsx)("div",{className:"rdr-scenario-fields",children:fields.map(([key,label,step])=>(0,h.jsxs)("label",{children:[label,(0,h.jsx)("input",{type:"number",min:0,max:key==="eler"?100:void 0,step,value:scenario[key]??"",onChange:ev=>setScenario({...scenario,[key]:key==="days"&&ev.target.value!==""?String(Math.round(Number(ev.target.value))):ev.target.value})})]},key))}),(0,h.jsxs)("div",{className:"rdr-egg-solve",children:[(0,h.jsx)("b",{children:"Let the simulator balance it"}),(0,h.jsx)("p",{children:"Choose which of the three variables should absorb the discrepancy. The other two remain fixed."}),(0,h.jsxs)("div",{className:"rdr-egg-solve-actions",children:[(0,h.jsx)("button",{type:"button",onClick:()=>solve("eler"),disabled:!(birds>0&&Number.isFinite(pcs)&&Number.isFinite(days)&&days>0),children:"Solve with ELER"}),(0,h.jsx)("button",{type:"button",onClick:()=>solve("pcs"),disabled:!(birds>0&&Number.isFinite(eler)&&Number.isFinite(days)&&days>0),children:"Solve with Egg Pieces"}),(0,h.jsx)("button",{type:"button",onClick:()=>solve("days"),disabled:!Number.isFinite(window.__rdrEggLayingDays({...v,pcs:scenario.pcs,eler:scenario.eler})),children:"Solve with Days"})]})]}),(0,h.jsxs)("div",{className:`rdr-scenario-results ${balanced?"is-balanced":"is-open"}`,"aria-live":"polite",children:[(0,h.jsx)("p",{children:`Desk formula gap: ${Number.isFinite(baseGap)?`${baseGap>=0?"+":""}${L(baseGap,0)} pieces`:"—"}`}),(0,h.jsx)("strong",{children:balanced?"Balanced":Number.isFinite(gap)?"Needs balancing":"Enter enough values to calculate the balance."}),Number.isFinite(expected)&&(0,h.jsx)("p",{children:`Expected production: ${L(expected,0)} pieces`} ),Number.isFinite(gap)&&(0,h.jsx)("p",{children:`Scenario gap: ${gap>=0?"+":""}${L(gap,0)} pieces${expected?` (${gap>=0?"+":""}${L(gap/expected*100,2)}%)`:""}`} ),Number.isFinite(mt)&&(0,h.jsx)("p",{children:`Scenario production: ${L(mt,2)} MT using the desk conversion factor (${L(Number(v.cf),2)} eggs/kg).`}),issues.length>0&&(0,h.jsx)("div",{className:"rdr-egg-issues",children:issues.map((x,i)=>(0,h.jsx)("p",{children:x},i))})]}),(0,h.jsxs)("div",{className:"rdr-egg-footer-actions",children:[(0,h.jsx)("button",{type:"button",className:"rdr-egg-apply",onClick:apply,disabled:!setDesk||readOnlyTotal||!Number.isFinite(pcs)||!Number.isFinite(days)||!Number.isFinite(eler),children:"Apply to desk"}),(0,h.jsx)("button",{type:"button",className:"rdr-egg-reset",onClick:()=>setScenario({eler:v.eler??"",pcs:v.pcs??"",days:v.days??92}),children:"Reset to desk"})]})]})}function Hk(e,t){return e.kind==="egg"?`Egg production ${L(t.pcs)} pcs, ${L(t.mt,2)} MT | laying days ${L(t.daysLaid,1)} of ${t.limit}`:e.kind==="dairy"?`Female breeders ${L(t.fb)} | milkline ${L(t.ml)} | milk ${L(t.liters)} L`:`Total supply ${L(t.ts)} | Sold live for slaughter ${L(t.soldLive)} | Production ${L(t.prodHd)} hd, ${L(t.prodMt,2)} MT LW`}i(Hk,"summaryOf");function Wk({P:e,v:t,set:n,r,q:o,ship:rdS,shipInc:rdI}){let s=e.kind==="poultry"||e.kind==="broiler";return(0,h.jsxs)(h.Fragment,{children:[(0,h.jsxs)(on,{title:"Supply",total:r.ts,children:[(0,h.jsx)($,{label:"Beginning inventory",k:"beg",v:t,set:n}),(0,h.jsx)($,{label:"Received / acquired",k:"rec",v:t,set:n}),(0,h.jsx)($,{label:s?"Hatched live":"Born live",k:"born",v:t,set:n}),e.kind==="swine"&&(0,h.jsx)($,{label:"Sows that gave birth",k:"sows",v:t,set:n}),(0,h.jsx)($,{label:"Shipped in, breeding/fattening",k:"shipIn",v:t,set:n})]}),(0,h.jsxs)(on,{title:"Disposition",children:[(0,h.jsx)($,{label:"Deaths / losses",k:"deaths",v:t,set:n}),(0,h.jsx)($,{label:"Slaughtered/dressed in HH, estab, other areas",k:"hh",v:t,set:n}),(0,h.jsx)($,{label:"Sold live for other purposes",k:"other",v:t,set:n}),(0,h.jsx)(xs,{label:"Sold live for slaughter",value:r.soldLive,bad:r.soldLive<0})]}),(0,h.jsxs)(on,{title:"End of quarter",children:[(0,h.jsx)($,{label:"Ending inventory",k:"end",v:t,set:n}),(0,h.jsx)($,{label:`Female breeders (${e.fbLabel.replace(" share","").toLowerCase()})`,k:"fb",v:t,set:n})]}),(0,h.jsxs)(on,{title:"Production",children:[(0,h.jsx)($,{label:"Average liveweight, kg",k:"alw",v:t,set:n,decimal:!0}),(0,h.jsx)(xs,{label:`Production, ${s?"birds":"heads"}`,value:r.prodHd,bad:r.prodHd<0}),(0,h.jsx)(xs,{label:"Production, MT liveweight",value:r.prodMt,digits:2})]}),(0,h.jsxs)(on,{title:"Checks against",children:[(0,h.jsx)($,{label:"Local SLH/PDP (Col 21)",k:"slh",v:t,set:n}),(0,h.jsx)($,{label:"SLH shipped in from other prov. (Col 23)",k:"slhIn",v:t,set:n}),(0,h.jsx)($,{label:"Shipped out, admin records (Col 25)",k:"shipOutAdmin",v:t,set:n,shipFlag:rdS?"mismatch":rdI?"incomplete":undefined,tooltip:window.__rdrVals?.layer!=="total"?undefined:`Expected shipped out: ${["beg","rec","born","shipIn","deaths","hh","other","end","slh"].every(f=>Number.isFinite(rdrNum(t[f])))?L(r.soldLive-rdrNum(t.slh)):"not available yet"}\nSold live for slaughter − local SLH/PDP`+(rdS?`\n\nDoes not match Household + Establishment\nTotal shows: ${L(rdS.total)}\nHousehold sold live: ${L(rdS.household)}\nEstablishment sold live: ${L(rdS.establishment)}\nLess Total local SLH/PDP: ${L(rdS.localSlh)}\nExpected from H + E: ${L(rdS.expected)}\nDifference: ${rdS.diff>0?"+":""}${L(rdS.diff)}`:rdI?`\n\nCannot compare with H + E yet\nMissing: ${rdI.missing.join(", ")}`:"")}),e.kind==="broiler"&&(0,h.jsx)($,{label:"Max housing capacity",k:"cap",v:t,set:n}),e.kind==="poultry"&&(0,h.jsx)($,{label:"Eggs for hatching, prev qtr",k:"prevHatch",v:t,set:n}),(0,h.jsx)($,{label:`Production, ${o} 2025`,k:"prevProd",v:t,set:n}),(0,h.jsx)($,{label:`Ending inventory, ${o} 2025`,k:"prevEnd",v:t,set:n}),(0,h.jsx)($,{label:`ALW, ${o} 2025`,k:"prevAlw",v:t,set:n,decimal:!0})]})]})}i(Wk,"SDLedger");function Gk({v:e,set:t,r:n,P:eggP}){return(0,h.jsxs)(h.Fragment,{children:[(0,h.jsxs)(on,{title:"Indicators",children:[(0,h.jsx)($,{label:"Beginning laying flock",k:"lf",v:e,set:t}),(0,h.jsx)($,{label:"RTL pullets received",k:"rtl",v:e,set:t}),(0,h.jsx)($,{label:"ELER, % (blank if unavailable)",k:"eler",v:e,set:t,decimal:!0}),(0,h.jsx)($,{label:"Days in quarter",k:"days",v:e,set:t})]}),(0,h.jsxs)(on,{title:"Production",children:[(0,h.jsx)($,{label:"Egg production, pieces",k:"pcs",v:e,set:t}),(0,h.jsx)($,{label:"Conversion factor, eggs/kg",k:"cf",v:e,set:t,decimal:!0}),(0,h.jsx)($,{label:"Intended for hatching, pieces",k:"hatch",v:e,set:t}),(0,h.jsx)($,{label:"Shipped out to other provinces, pieces",k:"shipOut",v:e,set:t}),(0,h.jsx)(xs,{label:"Egg production, MT",value:n.mt,digits:2})]})]})}i(Gk,"EggLedger");function Kk({P:e,r:t}){let n=t.daysLaid<=t.limit+1e-9,r=Number.isFinite(t.daysLaid)?Math.min(t.daysLaid/t.limit,1.25):0;return(0,h.jsxs)("div",{className:"rounded-[14px] bg-ink p-5 text-paper",children:[(0,h.jsx)("p",{className:"font-display text-[14px] font-semibold uppercase tracking-[0.14em] text-paper-70",children:"Days the flock would need to lay this"}),(0,h.jsxs)("div",{className:"mt-2 flex items-end gap-3 font-mono",children:[(0,h.jsx)("span",{className:`text-[64px] font-bold leading-none tracking-[-0.03em] ${n?"text-[#b9cc7a]":"text-[#ffc2bf]"}`,children:Number.isFinite(t.daysLaid)?L(t.daysLaid,1):"\u2013"}),(0,h.jsxs)("span",{className:"pb-2 text-[16px] text-paper-70",children:["of ",t.limit," allowed"]})]}),(0,h.jsxs)("div",{className:"relative mt-4 h-4 rounded-full bg-paper-10",children:[(0,h.jsx)(tt.div,{initial:!1,className:`absolute inset-y-0 left-0 rounded-full ${n?"bg-olive":"bg-brick"}`,animate:{width:`${r/1.25*100}%`},transition:{type:"spring",stiffness:140,damping:22}}),(0,h.jsx)("div",{className:"absolute -bottom-1.5 -top-1.5 w-[3px] rounded-full bg-ochre",style:{left:`${100/1.25}%`}})]}),(0,h.jsx)("p",{className:"mt-3 text-[14px] text-paper-80",children:e.mode==="native"?"Days = pieces ÷ (laying flock + RTL), adjusted by ELER/100 when supplied. Native/duck reference: 52 days.":"Days = pieces ÷ (laying flock + RTL), adjusted by ELER/100 when supplied."})]})}i(Kk,"EggHero");function Qk({v:e,set:t,r:n}){return(0,h.jsxs)(h.Fragment,{children:[(0,h.jsxs)(on,{title:"Herd",children:[(0,h.jsx)($,{label:"Total inventory (from S-D)",k:"inv",v:e,set:t}),(0,h.jsx)($,{label:"Female breeders",k:"fb",v:e,set:t}),(0,h.jsx)($,{label:"Animals in the milkline",k:"ml",v:e,set:t})]}),(0,h.jsxs)(on,{title:"Milk",children:[(0,h.jsx)($,{label:"Average milk per day, liters",k:"lpd",v:e,set:t,decimal:!0}),(0,h.jsx)($,{label:"Days in quarter",k:"days",v:e,set:t}),(0,h.jsx)(xs,{label:"Milk production, liters",value:n.liters})]})]})}i(Qk,"DairyLedger");function qk({P:e,r:t}){let n=Number.isFinite(t.mlShare)?Math.min(t.mlShare,110):0;return(0,h.jsxs)("div",{className:"rounded-[14px] bg-ink p-5 text-paper",children:[(0,h.jsxs)("p",{className:"font-display text-[14px] font-semibold uppercase tracking-[0.14em] text-paper-70",children:[e.subName," milk this quarter"]}),(0,h.jsxs)("div",{className:"mt-2 flex items-end gap-3 font-mono",children:[(0,h.jsx)("span",{className:"text-[56px] font-bold leading-none tracking-[-0.03em]",children:L(t.liters)}),(0,h.jsx)("span",{className:"pb-2 text-[16px] text-paper-70",children:"liters"})]}),(0,h.jsxs)("div",{className:"relative mt-4 h-4 rounded-full bg-paper-10",children:[(0,h.jsx)(tt.div,{initial:!1,className:`absolute inset-y-0 left-0 rounded-full ${t.ml<t.fb?"bg-olive":"bg-brick"}`,animate:{width:`${n/110*100}%`}}),(0,h.jsx)("div",{className:"absolute -bottom-1.5 -top-1.5 w-[3px] rounded-full bg-ochre",style:{left:`${100/1.1}%`}})]}),(0,h.jsx)("p",{className:"mt-3 text-[14px] text-paper-80",children:"Milkline as a share of female breeders. It has to stay left of the marker."})]})}i(qk,"DairyHero");function om({label:e,value:t}){return(0,h.jsxs)("div",{children:[(0,h.jsx)("p",{className:"font-display text-[14px] font-extrabold uppercase tracking-[0.1em] text-muted",children:e}),(0,h.jsx)("p",{className:"mt-1 font-mono text-[28px] font-bold leading-none",children:t})]})}i(om,"Stat");function on({title:e,total:t,children:n}){return(0,h.jsxs)("div",{className:"mt-5",children:[(0,h.jsxs)("div",{className:"flex items-baseline justify-between border-b-2 border-ink pb-1",children:[(0,h.jsx)("h3",{className:"font-display text-[14px] font-extrabold uppercase tracking-[0.14em]",children:e}),t!==void 0&&(0,h.jsx)("span",{className:"font-mono text-[16px] font-bold",children:L(t)})]}),(0,h.jsx)("div",{className:"divide-y divide-line",children:n})]})}i(on,"Group");function rdrMathEval(e){let t=String(e??"").trim();if(!t)return null;t=t.replace(/^=/,"").replace(/,/g,"").replace(/\s+/g,"");if(!t||!/^[0-9.+\-*/()%]+$/.test(t))return null;let n=0;const r=()=>{let e=o();for(;;){if(t[n]==="+"){n++;e+=o()}else if(t[n]==="-"){n++;e-=o()}else return e}},o=()=>{let e=s();for(;;){if(t[n]==="*"){n++;e*=s()}else if(t[n]==="/"){n++;let r=s();if(r===0)return NaN;e/=r}else return e}},s=()=>{if(t[n]==="+"){n++;return s()}if(t[n]==="-"){n++;return-s()}let e;if(t[n]==="("){n++;e=r();if(t[n]!==")")return NaN;n++}else{let r=n,d=!1;for(;n<t.length&&(/[0-9]/.test(t[n])||t[n]==="."&&!d);)t[n]==="."&&(d=!0),n++;if(r===n)return NaN;e=Number(t.slice(r,n))}for(;t[n]==="%";)e/=100,n++;return e};const a=r();return n===t.length&&Number.isFinite(a)?a:null}globalThis.__rdrMathEval=rdrMathEval;function $({label:e,k:t,v:n,set:r,decimal:o,tooltip:tip,shipFlag:flag}){const raw=(window.__rdrConsistency||[]).filter(c=>c.fields?.includes(t)&&(c.level==="error"||c.level==="flag")),issues=[...new Map(raw.map(c=>[c.id||c.title,c])).values()];if(issues.length){tip=[tip,...issues.map(c=>c.consistency?(c.level==="error"?"Hard inconsistency: ":"Plausibility warning: ")+c.title+": "+c.detail:"PSA validation: "+c.title+": "+c.detail)].filter(Boolean).join("\n\n");if(issues.some(c=>c.level==="error"))flag="mismatch";else if(!flag&&issues.some(c=>c.level==="flag"))flag="incomplete"}let cancel=(0,me.useRef)(false),[s,a]=(0,me.useState)(!1),[d,m]=(0,me.useState)(""),l=n[t]??"",u=_e(l),c=s?d:l===""||Number.isNaN(u)?l:o?L(u,2):L(u,Number.isInteger(u)?0:2),f=`f-${t}`,x=()=>{if(cancel.current){cancel.current=false;m(String(l));a(!1);return}let e=d.trim();if(e===""){r(t,"");a(!1);return}let n=rdrMathEval(e);n!==null&&n<0?(window.__rdrFlash&&window.__rdrFlash("Negative values are not allowed here. The previous value was kept.")):n!==null?r(t,String(n)):(window.__rdrFlash?window.__rdrFlash("Invalid formula. The previous value was kept."):null),a(!1)};return(0,h.jsxs)("div",{className:`flex items-center justify-between gap-3 py-1.5 ${tip?"rdr-admin-tip":""}`,children:[(0,h.jsx)("label",{htmlFor:f,className:"min-w-0 text-[14px] leading-tight",children:e}),(0,h.jsx)("input",{id:f,"aria-describedby":tip?f+"-tip":undefined,inputMode:"decimal",value:c,placeholder:"0 or =100+25",title:"Enter a value or formula, e.g. =100+25",onFocus:()=>{m(String(l).replace(/,/g,""));a(!0)},onBlur:x,onKeyDown:e=>{e.key==="Enter"&&(e.preventDefault(),e.currentTarget.blur()),e.key==="Escape"&&(e.preventDefault(),cancel.current=true,e.currentTarget.blur())},onChange:e=>m(e.target.value),className:`cell w-[148px] shrink-0 rounded-[6px] px-2 py-1.5 text-right font-mono text-[16px] font-semibold ${flag==="mismatch"?"rdr-admin-mismatch":flag==="incomplete"?"rdr-admin-incomplete":""}`}),tip&&(0,h.jsx)("span",{id:f+"-tip",role:"tooltip",className:"rdr-shipped-tooltip",children:tip})]})}i($,"Cell");function xs({label:e,value:t,bad:n,digits:r=0,incomplete:inc=false,tooltip:tip}){return(0,h.jsxs)("div",{className:"flex items-center justify-between gap-3 py-1.5",children:[(0,h.jsx)("span",{className:"text-[14px] font-semibold leading-tight",children:e}),(0,h.jsxs)(tt.span,{initial:{scale:.96},animate:{scale:1},tabIndex:tip?0:undefined,"aria-label":tip?`${e}: ${L(t,r)}. ${tip}`:undefined,className:`w-[148px] shrink-0 px-2 py-1.5 text-right font-mono text-[16px] font-bold ${tip?"rdr-shipped-tip ":""}${n?"rounded-[6px] bg-brick text-paper":inc?"rdr-shipped-incomplete":"text-olive"}`,children:[L(t,r),tip&&(0,h.jsx)("span",{role:"tooltip",className:"rdr-shipped-tooltip",children:tip})]},Math.sign(t))]})}i(xs,"Derived");var E1=[{k:"deaths",label:"Deaths",c:"#b04948"},{k:"hh",label:"HH/estab slaughter",c:"#c88a2c"},{k:"local",label:"Local SLH/PDP",c:"#4c6216"},{k:"ship",label:"Shipped out",c:"#8fa34f"},{k:"other",label:"Sold other purposes",c:"#9e4013"},{k:"end",label:"Ending inventory",c:"#3d7a52"}];function Yk({r:e}){if(!Number.isFinite(e.soldLive))return null;let t=Math.max(e.soldLive,0),n=Math.min(t,e.slh),r=Math.max(t-n,0),o={deaths:e.deaths,hh:e.hh,local:n,ship:r,other:e.other,end:e.end},s=Object.values(o).reduce((c,f)=>c+f,0),a=Math.max(e.ts,s,1),l=Math.max(s-e.ts,0),u=e.soldLive>=0;return(0,h.jsxs)("div",{className:"rounded-[14px] bg-ink p-5 text-paper",children:[(0,h.jsxs)("div",{className:"flex flex-wrap items-baseline justify-between gap-2",children:[(0,h.jsx)("p",{className:"font-display text-[14px] font-semibold uppercase tracking-[0.14em] text-paper-70",children:"Where the supply went"}),(0,h.jsx)("p",{className:`font-display text-[16px] font-extrabold ${u?"text-[#b9cc7a]":"text-[#ffc2bf]"}`,children:u?"Balanced S-D":`Unbalanced by ${L(l)}`})]}),(0,h.jsxs)("div",{className:"mt-3 flex items-end justify-between font-mono",children:[(0,h.jsx)("span",{className:"text-[14px] text-paper-70",children:"Total supply"}),(0,h.jsx)("span",{className:"text-[30px] font-bold leading-none tracking-[-0.02em]",children:L(e.ts)})]}),(0,h.jsxs)("div",{className:"relative mt-3 h-14",children:[(0,h.jsx)("div",{className:"absolute inset-y-0 left-0 rounded-[6px] bg-paper-10",style:{width:`${e.ts/a*100}%`}}),(0,h.jsx)("div",{className:"absolute inset-0 flex overflow-hidden rounded-[6px]",children:E1.map(c=>(0,h.jsx)(tt.div,{initial:!1,className:"h-full shrink-0 border-r border-ink-40 last:border-r-0",style:{background:c.c},animate:{width:`${o[c.k]/a*100}%`},transition:{type:"spring",stiffness:160,damping:24},title:`${c.label}: ${L(o[c.k])}`},c.k))}),l>0&&(0,h.jsx)(tt.div,{className:"hatch absolute inset-y-0 rounded-r-[6px]",initial:{opacity:0},animate:{opacity:1,left:`${e.ts/a*100}%`,width:`${l/a*100}%`}}),(0,h.jsx)(tt.div,{initial:!1,className:"absolute -bottom-2 -top-2 w-[3px] rounded-full bg-ochre",animate:{left:`calc(${e.ts/a*100}% - 1.5px)`}})]}),(0,h.jsx)("div",{className:"mt-4 grid grid-cols-2 gap-x-4 gap-y-1.5 sm:grid-cols-3",children:E1.map(c=>(0,h.jsxs)("div",{className:"flex items-center justify-between gap-2 text-[14px]",children:[(0,h.jsxs)("span",{className:"flex min-w-0 items-center gap-2",children:[(0,h.jsx)("i",{className:"h-3 w-3 shrink-0 rounded-[3px]",style:{background:c.c}}),(0,h.jsx)("span",{className:"truncate text-paper-80",children:c.label})]}),(0,h.jsx)("span",{className:"font-mono font-semibold",children:L(o[c.k])})]},c.k))})]})}i(Yk,"FlowStrip");function C1({n:e,label:t,tone:n}){return(0,h.jsxs)("span",{className:`inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[14px] font-semibold ${e?`${n==="brick"?"bg-brick":"bg-rust"} text-paper`:"bg-olive-15 text-olive"}`,children:[(0,h.jsx)("span",{className:"font-mono text-[16px] font-bold",children:e}),t]})}i(C1,"Tally");function Xk({x:e,ctx:d}){let[t,n]=e.range,r=n-t||1,o=e.value,s=Number.isFinite(o),a=Math.max(0,Math.min(s?o:t,t-r*.8)),l=Math.max(s?o:n,n+r*.8),u=i(f=>(f-a)/(l-a)*100,"pos"),c=e.level==="ok"?"#4c6216":e.level==="error"?"#b04948":e.level==="flag"?"#9e4013":"#7a8270",m=e.digits??1,p=`${d||"global"}::${e.id||e.label||"reason"}`,[g,y]=(0,me.useState)("");(0,me.useEffect)(()=>{if(e.level!=="flag")return;try{let f=JSON.parse(localStorage.getItem("rdr.reason.comments")||"{}");y(f[p]||"")}catch{y("")}},[p,e.level]);let v=i(()=>{try{let f=JSON.parse(localStorage.getItem("rdr.reason.comments")||"{}");g.trim()?f[p]=g:delete f[p],localStorage.setItem("rdr.reason.comments",JSON.stringify(f)),window.__rdrCommentNote&&window.__rdrCommentNote(p,g,e.label)}catch{window.alert("This comment could not be saved. Copy your text before closing and check browser storage.")}},"saveRailReasonComment");return(0,h.jsxs)("div",{className:"rounded-[12px] border-2 border-line bg-card p-3",children:[(0,h.jsxs)("div",{className:"flex items-baseline justify-between gap-2",children:[(0,h.jsxs)("div",{children:[(0,h.jsx)("p",{className:"font-display text-[14px] font-extrabold uppercase tracking-[0.1em]",children:e.label}),e.origin&&(0,h.jsx)("span",{className:"rdr-origin rdr-origin-"+e.originKey,style:{marginTop:4},children:e.origin})]}),(0,h.jsx)("p",{className:"font-mono text-[22px] font-bold leading-none",style:{color:c},children:s?L(o,m):"\u2013"})]}),(0,h.jsxs)("div",{className:"relative mt-4 h-3 rounded-full bg-line",children:[(0,h.jsx)("div",{className:"absolute inset-y-0 rounded-full bg-olive-35",style:{left:`${u(t)}%`,width:`${u(n)-u(t)}%`}}),s&&(0,h.jsx)(tt.div,{className:"absolute top-1/2 h-5 w-5 -translate-x-1/2 -translate-y-1/2 rounded-full border-[3px] border-card shadow",style:{background:c},initial:!1,animate:{left:`${Math.min(Math.max(u(o),0),100)}%`},transition:{type:"spring",stiffness:200,damping:22}})]}),(0,h.jsxs)("div",{className:"mt-1.5 flex justify-between font-mono text-[14px] text-muted",children:[(0,h.jsx)("span",{children:e.unit}),(0,h.jsxs)("span",{children:["ok ",L(t,m)," to ",L(n,m)]})]}),(0,h.jsx)("p",{className:"mt-2 text-[14px] leading-snug",children:s||e.id==="alw"?e.note:"Can't compute yet: a cell this ratio needs is blank."}),rdFixBtns(e.fixes),e.level==="flag"&&(0,h.jsxs)("div",{className:"mt-3 border-t border-rust/20 pt-3",children:[(0,h.jsx)("label",{className:"block font-display text-[13px] font-bold text-rust",children:"Your comment / explanation"}),(0,h.jsx)("textarea",{value:g,onChange:f=>y(f.target.value),onBlur:v,rows:2,placeholder:"Reason, source or event for this result",className:"mt-1 w-full resize-y rounded-[8px] border-2 border-rust/30 bg-paper px-3 py-2 text-[14px] leading-snug text-ink outline-none focus:border-rust"}),(0,h.jsxs)("div",{className:"mt-1 flex items-center gap-2",style:{justifyContent:"flex-end"},children:[(0,h.jsx)("button",{type:"button",onClick:v,className:"rounded-[7px] border border-rust px-2.5 py-1 text-[12px] font-bold text-rust hover:bg-rust-10",children:"Save comment"})]})]})]})}i(Xk,"Rail");function sm({x:e,ctx:a}){let t={ok:"border-olive-40 bg-olive-10",info:"border-line bg-card",flag:"border-rust bg-rust-10",error:"border-brick bg-brick-10"},n={ok:"OK",info:"Note",flag:"Reason",error:"Fix"}[e.level],r={ok:"bg-olive",info:"bg-muted",flag:"bg-rust",error:"bg-brick"}[e.level],o=`${a||"global"}::${e.id||e.title||e.label||"reason"}`,[s,l]=(0,me.useState)("");(0,me.useEffect)(()=>{if(e.level!=="flag")return;try{let u=JSON.parse(localStorage.getItem("rdr.reason.comments")||"{}");l(u[o]||"")}catch{l("")}},[o,e.level]);let c=i(()=>{try{let u=JSON.parse(localStorage.getItem("rdr.reason.comments")||"{}");s.trim()?u[o]=s:delete u[o],localStorage.setItem("rdr.reason.comments",JSON.stringify(u)),window.__rdrCommentNote&&window.__rdrCommentNote(o,s,e.title)}catch{window.alert("This comment could not be saved. Copy your text before closing and check browser storage.")}},"saveReasonComment");return(0,h.jsxs)(tt.div,{layout:!0,initial:{opacity:0,y:6},animate:{opacity:1,y:0},exit:{opacity:0},className:`flex gap-3 rounded-[12px] border-2 p-3 ${t[e.level]}`,children:[(0,h.jsx)("span",{className:`h-fit shrink-0 rounded-[6px] px-2 py-0.5 font-mono text-[14px] font-bold text-paper ${r}`,children:n}),(0,h.jsxs)("div",{className:"min-w-0 flex-1",children:[(0,h.jsxs)("div",{className:"rdr-card-head",children:[(0,h.jsx)("p",{className:"font-display text-[16px] font-semibold leading-tight",children:e.title}),e.origin&&(0,h.jsx)("span",{className:"rdr-origin rdr-origin-"+e.originKey,children:e.origin})]}),(0,h.jsx)("p",{className:"mt-1 text-[14px] leading-snug text-ink-80",style:{whiteSpace:"pre-line"},children:e.detail}),rdFixBtns(e.fixes),e.stats?.length>0&&(0,h.jsx)("p",{className:"mt-2 font-mono text-[14px] font-semibold",children:e.stats.join("  \xB7  ")}),e.items&&(0,h.jsx)("ul",{className:"mt-2 grid gap-x-6 gap-y-1 sm:grid-cols-2",children:e.items.map(u=>(0,h.jsxs)("li",{className:"flex gap-2 font-mono text-[14px] font-semibold",children:[(0,h.jsx)("span",{className:"text-brick",children:"\u25AA"}),u]},u))}),e.level==="flag"&&(0,h.jsxs)("div",{className:"mt-3 border-t border-rust/20 pt-3",children:[(0,h.jsx)("label",{className:"block font-display text-[13px] font-bold text-rust",children:"Your comment / explanation"}),(0,h.jsx)("textarea",{value:s,onChange:u=>l(u.target.value),onBlur:c,rows:2,placeholder:"Reason, source or event for this result",className:"mt-1 w-full resize-y rounded-[8px] border-2 border-rust/30 bg-paper px-3 py-2 text-[14px] leading-snug text-ink outline-none focus:border-rust"}),(0,h.jsxs)("div",{className:"mt-1 flex items-center gap-2",style:{justifyContent:"flex-end"},children:[(0,h.jsx)("button",{type:"button",onClick:c,className:"rounded-[7px] border border-rust px-2.5 py-1 text-[12px] font-bold text-rust hover:bg-rust-10",children:"Save comment"})]})]})]})]})}i(sm,"Card");function Zk({title:e,summary:t,checks:n,ctx:r}){let[o,s]=(0,me.useState)(!1),a=i(()=>{let l={};try{l=JSON.parse(localStorage.getItem("rdr.reason.comments")||"{}")}catch{}return[`${e} (RDR notes)`,t,...n.filter(u=>u.level==="error"||u.level==="flag").map(u=>{let c=`${r||"global"}::${u.id||u.title||u.label||"reason"}`,f=u.level==="flag"&&l[c]?`\n  Your comment: ${l[c]}`:"";return`- [${u.consistency||u.id==="shiphe"?"INTERNAL":"PSA"}] [${u.level==="error"?"FIX":"REASON"}] ${u.title||u.label}: ${String(u.detail||u.note||"").replace(/\n/g,"; ")}${u.items?`\n    `+u.items.join(`\n    `):""}${f}`})].join(`\n`)},"text");return(0,h.jsx)("button",{type:"button",onClick:i(async()=>{let l=a();try{await navigator.clipboard.writeText(l)}catch{let u=document.createElement("textarea");u.value=l,document.body.appendChild(u),u.select();try{document.execCommand("copy")}catch{}u.remove()}s(!0),setTimeout(()=>s(!1),1600)},"copy"),className:"ml-auto rounded-full border-2 border-ink px-4 py-1.5 font-display text-[14px] font-semibold transition hover:bg-ink hover:text-paper",children:o?"Copied \u2713":"Copy RDR notes"})}i(Zk,"CopyNotes");var Jk=["Carabao","Cattle","Hog","Goat","Sheep","Horse","Rabbit","Chicken","Broiler","Layer","Native/Improved","Duck","Quail","Turkey","Goose"],e5=new Set(["Broiler","Layer","Native/Improved"]),T1=(()=>{let e=["Negros Occidental","Bacolod City","Negros Oriental","Siquijor","NIR"];try{let t=JSON.parse(localStorage.getItem("rdr.import.provinces")||"[]");return[...new Set([...e,...(Array.isArray(t)?t:[])])]}catch{return e}})(),t5=i((e,t)=>t?(e-t)/t*100:NaN,"g");function n5(){return(0,h.jsx)("section",{className:"mx-auto max-w-[1240px] px-6 pt-6",children:(0,h.jsx)("div",{id:"rdr-narrative-host"})})}i(n5,"NarrativeReportView");function r5({x:e,dark:t,a:a,p:p}){const yr=Number(localStorage.getItem("rdr.year.current")||2026),cur=yr===2025?e?.y25:e?.y26,prev=yr===2026?e?.y25:null,nb={"data-slh":a+"|"+p,tabIndex:0,role:"button","aria-label":"Add a note for "+(a==="Hog"?"Swine":a)+" in "+p};if(!e||cur==null)return(0,h.jsx)("td",{...nb,"data-y25":e?.y25??"","data-y26":e?.y26??"","data-yoy":"",className:"px-4 py-3 text-right font-mono text-[16px] text-muted",children:"\u2013"});let n=prev!=null?t5(cur,prev):NaN,r=Number.isFinite(n)&&Math.abs(n)>=20,o=prev==null&&cur>0;return(0,h.jsxs)("td",{...nb,"data-y25":e.y25??"","data-y26":e.y26??"","data-yoy":Number.isFinite(n)?n:"","data-swing":r?"1":void 0,className:`px-4 py-3 text-right align-top ${t?"bg-olive-10":""}`,children:[(0,h.jsx)("div",{className:"font-mono text-[16px] font-bold",children:L(cur)}),(0,h.jsx)("div",{className:`mt-0.5 font-mono text-[14px] ${o?"text-muted":r?"font-bold text-rust":"text-muted"}`,children:yr===2025?"2025 selected":Number.isFinite(n)?`${n>=0?"+":""}${L(n,1)}%`:"\u2013"})]})}i(r5,"GCell");function o5(){let[e,t]=(0,me.useState)(()=>Mr("rdr.check",{}));(0,me.useEffect)(()=>_o("rdr.check",e),[e]);let n=tm.flatMap(o=>o.items),r=n.filter(o=>e[o]).length;return(0,h.jsx)("section",{className:"mx-auto max-w-[1240px] px-6 pt-6",children:(0,h.jsxs)("div",{className:"grid gap-6 lg:grid-cols-[minmax(0,1fr)_340px]",children:[(0,h.jsxs)("div",{children:[(0,h.jsxs)("div",{className:"flex items-end justify-between gap-4",children:[(0,h.jsx)("h2",{className:"font-display text-[34px] font-extrabold leading-none tracking-[-0.02em]",children:"Ready for the RDR?"}),(0,h.jsxs)("p",{className:"font-mono text-[22px] font-bold text-olive",children:[r,"/",n.length]})]}),(0,h.jsx)("div",{className:"mt-3 h-2 overflow-hidden rounded-full bg-line",children:(0,h.jsx)(tt.div,{className:"h-full bg-olive",animate:{width:`${r/n.length*100}%`}})}),(0,h.jsx)("div",{className:"mt-6 grid gap-5 md:grid-cols-2",children:tm.map(o=>(0,h.jsxs)("div",{className:"rounded-[14px] border-2 border-line bg-card p-4",children:[(0,h.jsx)("h3",{className:"font-display text-[14px] font-extrabold uppercase tracking-[0.14em]",children:o.group}),(0,h.jsx)("ul",{className:"mt-2",children:o.items.map(s=>(0,h.jsx)("li",{children:(0,h.jsxs)("label",{className:"flex cursor-pointer gap-3 rounded-[8px] px-1 py-2 hov-olive",children:[(0,h.jsx)("input",{type:"checkbox",className:"tick mt-0.5",checked:!!e[s],onChange:()=>t(a=>({...a,[s]:!a[s]}))}),(0,h.jsx)("span",{className:`text-[14px] leading-snug ${e[s]?"text-muted line-through":""}`,children:s})]})},s))})]},o.group))}),(0,h.jsx)("button",{type:"button",onClick:()=>t({}),className:"mt-4 font-display text-[14px] font-semibold text-rust underline-offset-4 hover:underline",children:"Reset checklist"})]}),(0,h.jsxs)("aside",{className:"h-fit rounded-[14px] bg-ink p-5 text-paper",children:[(0,h.jsx)("p",{className:"font-display text-[14px] font-semibold uppercase tracking-[0.14em] text-ochre",children:"Q3 milestones"}),(0,h.jsx)("ol",{className:"mt-3",children:h1.map((o,s)=>(0,h.jsxs)("li",{className:"relative border-l-2 border-paper-20 pb-4 pl-4 last:pb-0",children:[(0,h.jsx)("span",{className:`absolute -left-[7px] top-1 h-3 w-3 rounded-full ${s===1?"bg-ochre":"bg-paper-40"}`}),(0,h.jsx)("p",{className:"font-mono text-[14px] font-bold text-paper-70",children:o.d}),(0,h.jsx)("p",{className:`text-[16px] ${s===1?"font-semibold text-ochre":""}`,children:o.t})]},o.t))}),(0,h.jsx)("p",{className:"mt-4 font-serif text-[14px] italic text-paper-70",children:"Dates from the 2025 manual timetable. LPSD updates them by memo, so confirm this year's schedule."})]})]})})}i(o5,"ChecklistView");var lm=_(Mt());globalThis.__ARTIFACT_BUILD__??=1791947330722;var A1=document.getElementById("root");if(!A1)throw new Error("Artifact root element is missing.");(0,b1.createRoot)(A1).render((0,lm.jsx)(N1.Suspense,{fallback:null,children:(0,lm.jsx)(am,{})}));})();
+function Uk(){let[e,t0]=(0,me.useState)(()=>Mr("rdr4.cid","carabao")),[n,r0]=(0,me.useState)(()=>Mr("rdr4.subs",{})),[o,s0]=(0,me.useState)(()=>Mr("rdr3.prov","NIR")),[a,l0]=(0,me.useState)(()=>Mr("rdr2.q","Q3")),[u0,c]=(0,me.useState)(()=>Mr("rdr3.edits",{})),[rdDr,setRdDr]=(0,me.useState)({}),[rdPd,setRdPd]=(0,me.useState)({}),[rdRev,setRdRev]=(0,me.useState)(0),[srcParts,setSrcParts]=(0,me.useState)(()=>Mr("rdr.import.components",{})),[pe0,setPartEdits]=(0,me.useState)(()=>Mr("rdr3.componentEdits",{})),[layer,setLayer0]=(0,me.useState)(()=>Mr("rdr.view.layer","total")),[output,setOutput]=(0,me.useState)("review");const u=(0,me.useMemo)(()=>rdrMerge(u0,rdDr),[u0,rdDr]),partEdits=(0,me.useMemo)(()=>rdrMerge(pe0,rdPd),[pe0,rdPd]),rdDirty=Object.keys(rdDr).length>0||Object.keys(rdPd).length>0,rdGuard=fn=>{window.__rdrDirty&&window.__rdrConfirm?window.__rdrConfirm(fn):fn()},t=x=>rdGuard(()=>t0(x)),r=x=>rdGuard(()=>r0(x)),s=x=>rdGuard(()=>s0(x)),l=x=>rdGuard(()=>l0(x)),setLayer=x=>rdGuard(()=>setLayer0(x));window.__rdrDirty=rdDirty;window.__rdrLive={"rdr3.edits":rdDr,"rdr3.componentEdits":rdPd};window.__rdrDraft={count:()=>Object.values(rdDr).reduce((a,o)=>a+Object.keys(o).length,0)+Object.values(rdPd).reduce((a,o)=>a+Object.values(o).reduce((b,x)=>b+Object.keys(x).length,0),0),accept:()=>{const nu=rdrMerge(u0,rdDr),np=rdrMerge(pe0,rdPd);try{localStorage.setItem("rdr3.edits",JSON.stringify(nu));localStorage.setItem("rdr3.componentEdits",JSON.stringify(np))}catch{window.alert("Changes could not be saved in this browser. Your draft is still open. Free browser storage or export a backup before closing.");return false}c(JSON.parse(localStorage.getItem("rdr3.edits")||"{}"));setPartEdits(np);setSrcParts(JSON.parse(localStorage.getItem("rdr.import.components")||"{}"));setRdDr({});setRdPd({});setTimeout(()=>setRdRev(n=>n+1),60);return true},discard:()=>{setRdDr({});setRdPd({});setRdRev(n=>n+1)},setFields:o=>{for(const k in o)P(k,String(o[k]))},setPart:(k,L,f,v)=>setRdPd(j=>({...j,[k]:{...j[k]||{},[L]:{...j[k]?.[L]||{},[f]:v}}}))};(0,me.useEffect)(()=>{window.dispatchEvent(new Event("rdr-draft"))},[rdDr,rdPd]);(0,me.useEffect)(()=>_o("rdr4.cid",e),[e]),(0,me.useEffect)(()=>_o("rdr4.subs",n),[n]),(0,me.useEffect)(()=>_o("rdr3.prov",o),[o]),(0,me.useEffect)(()=>_o("rdr2.q",a),[a]),(0,me.useEffect)(()=>_o("rdr3.edits",u0),[u0]),(0,me.useEffect)(()=>_o("rdr3.componentEdits",pe0),[pe0]),(0,me.useEffect)(()=>_o("rdr.view.layer",layer),[layer]);let f=du.find(C=>C.id===e)||du[0],d=jk(f,n[e]),m=Bk(f,n[e]),x=i(C=>{const K=rm(m,C,a),seed=zk(d,C,a,m),parts=rdrMergedParts(K,srcParts,partEdits),base={...seed,...u[K]||{}};if(layer==="household"||layer==="establishment")return parts?.[layer]?{...parts[layer],_blanks:[]}:{_blanks:[]};return{...base,_blanks:$k(d,C,a,m).filter(M=>u[rm(m,M.prov||C,a)]?.[M.key||_k[M.field]]===void 0)}},"valsFor"),priorFor=C=>{const qi=nm.indexOf(a);if(qi<=0)return null;const pq=nm[qi-1],pk=rm(m,C,pq);if(layer==="total")return {...zk(d,C,pq,m),...(u[pk]||{})};return rdrMergedParts(pk,srcParts,partEdits)?.[layer]||null},v=x(o),S=rm(m,o,a),partsNow=rdrMergedParts(S,srcParts,partEdits),hasParts=!!(partsNow?.household&&partsNow?.establishment),totalRecon=rdrTotalMismatches(v,partsNow,d),totalMismatches=totalRecon.filter(M=>M.status==="mismatch"),totalIncomplete=totalRecon.filter(M=>M.status==="incomplete"),P=i((C,M)=>{if(d.kind==="egg"&&C==="days"&&String(M).trim()!==""&&Number.isFinite(Number(M)))M=String(Math.round(Number(M)));if((layer==="household"||layer==="establishment")&&partsNow?.[layer]){setRdPd(j=>({...j,[S]:{...j[S]||{},[layer]:{...j[S]?.[layer]||{},[C]:M}}}));setRdRev(n=>n+1);return}setRdDr(j=>({...j,[S]:{...j[S]||{},[C]:M}}));setRdRev(n=>n+1)},"set"),{r:g,checks:rdP1,has:y}=(0,me.useMemo)(()=>P1(d,v,a,priorFor(o),layer,partsNow,o),[d,v,a,u,srcParts,partEdits,layer]),rdShip=layer==="total"?totalMismatches.find(M=>M.field==="anticipatedShipOut"):null,rdShipInc=layer==="total"?totalIncomplete.find(M=>M.field==="anticipatedShipOut"):null,p=rdP1,w=p.filter(C=>C.level==="error").length,T=p.filter(C=>C.level==="flag").length,N=layer==="total"?!!u[S]&&(()=>{const r=u[S],mk=r.__nir!==undefined?JSON.parse(r.__nir||"{}"):{};return Object.keys(r).some(k=>k!=="__nir"&&!(k in mk&&String(r[k])===String(mk[k])))})():!!partEdits[S]?.[layer]&&Object.keys(partEdits[S][layer]).length>0,k=g1.map(C=>{let M=P1(d,x(C),a,priorFor(C),layer,rdrMergedParts(rm(m,C,a),srcParts,partEdits),C);return M.has?{p:C,e:M.checks.filter(j=>j.level==="error").length,f:M.checks.filter(j=>j.level==="flag").length}:{p:C,e:null,f:null}}),E=d.cd?ys.cdspdp[a]?.[d.cd]?.[o]:null,O=`${o} \xB7 ${a} ${Number(localStorage.getItem("rdr.year.current")||2026)}`,R=`${f.name}${f.subs?` \xB7 ${d.subName}`:""}`,A=i((C,M,j,Te,Un)=>(0,h.jsx)("div",{className:"flex flex-wrap rounded-[10px] bg-line p-1",role:"group","aria-label":Te,children:C.map(([ue,nt])=>(0,h.jsx)("button",{type:"button","aria-pressed":ue===M,onClick:()=>j(ue),className:`rounded-[7px] px-3 py-1.5 ${Un?"font-mono text-[16px] font-bold":"font-display text-[14px] font-semibold"} ${ue===M?"bg-card text-ink shadow-sm":"text-ink-80 hover:text-ink"}`,children:nt},ue))}),"seg");window.__rdrConsistency=rdP1.filter(C=>C.fields?.length);window.__rdrVals={key:S,year:Number(localStorage.getItem("rdr.year.current")||2026),cid:e,sub:m.split(":")[1]||"",prov:o,q:a,layer,kind:d.kind,has:y,v,parts:partsNow,total:layer==="total"?v:{...zk(d,o,a,m),...(u[S]||{})}};(0,me.useEffect)(()=>{window.dispatchEvent(new Event("rdr-vals"))},[JSON.stringify(v),S,layer,y]);return(0,h.jsxs)("section",{className:`rdr-commodity-workbench rdr-layer-${layer} mx-auto max-w-[1240px] px-6 pt-6`,"data-rdr-layer":layer,children:[(0,h.jsx)("div",{className:"flex flex-wrap gap-2",role:"tablist","aria-label":"Commodity",children:du.map(C=>(0,h.jsxs)("button",{type:"button",role:"tab","aria-selected":C.id===e,onClick:()=>t(C.id),className:`flex items-center gap-2 rounded-[10px] border-2 px-3 py-2 font-display text-[14px] font-semibold transition ${C.id===e?"border-ink bg-ink text-paper":"border-line bg-card text-ink hover:border-olive"}`,children:[(0,h.jsx)("span",{className:`font-mono text-[14px] ${C.id===e?"text-ochre":"text-muted"}`,children:C.code}),C.name,Object.keys(u).some(key=>key.startsWith(C.id+"|")||key.startsWith(C.id+":"))&&(0,h.jsx)("span",{className:`h-2 w-2 rounded-full ${C.id===e?"bg-ochre":"bg-olive"}`,title:"Workbook loaded"})]},C.id))}),(0,h.jsxs)("div",{className:"mt-4 flex flex-wrap items-stretch gap-3",children:[A(nm.map(C=>[C,C]),a,l,"Quarter",!0),f.subs&&A(f.subs.map(C=>[C.id,C.name]),d.id===f.id?n[e]||f.subs[0].id:null,C=>r(M=>({...M,[e]:C})),"Type"),A([["household","Household"],["establishment","Establishment"],["total","Total"]],layer,setLayer,"Source"),(0,h.jsx)("div",{className:"flex flex-wrap gap-2",role:"group","aria-label":"Province",children:k.map(({p:C,e:M,f:j})=>(0,h.jsxs)("button",{type:"button","aria-pressed":C===o,onClick:()=>s(C),className:`flex items-center gap-2 rounded-[10px] border-2 px-3 py-1.5 text-[14px] font-semibold transition ${C===o?"border-olive bg-olive text-paper":"border-line bg-card hover:border-olive"}`,children:[C==="NIR"?"NIR (region)":C,M===null?(0,h.jsx)("span",{className:`font-mono text-[14px] ${C===o?"text-paper":"text-muted"}`,children:"no data"}):(0,h.jsxs)("span",{className:"flex gap-1",children:[M>0&&(0,h.jsx)("span",{className:"rounded-full bg-brick px-1.5 font-mono text-[14px] font-bold leading-[20px] text-paper",children:M}),j>0&&(0,h.jsx)("span",{className:"rounded-full bg-rust px-1.5 font-mono text-[14px] font-bold leading-[20px] text-paper",children:j}),M===0&&j===0&&(0,h.jsx)("span",{className:`font-mono text-[14px] font-bold ${C===o?"text-paper":"text-olive"}`,children:"\u2713"})]})]},C))})]}),(0,h.jsxs)("div",{className:"rdr-output-bar",children:[(0,h.jsx)("div",{className:"rdr-output-tabs",role:"group","aria-label":"Commodity outputs",children:[["review","Review"],["sheet","Excel sheet"],["trends","Indicator trends"],["flow","Province flows"]].map(([id,label])=>(0,h.jsx)("button",{type:"button","aria-pressed":output===id,onClick:()=>setOutput(id),children:label},id))}),(0,h.jsx)("span",{className:"rdr-output-context",children:`${R} · ${o} · ${a} ${Number(localStorage.getItem("rdr.year.current")||2026)} · ${layer==="household"?"Household":layer==="establishment"?"Establishment":"Total"}`})]}),output==="trends"?(0,h.jsx)("section",{id:"rdr-ind-tab-host",className:"rdr-ind-tab-host","data-key":m,"data-province":o,"data-quarter":a,"data-year":Number(localStorage.getItem("rdr.year.current")||2026),"data-layer":layer},"trends:"+S+":"+layer):output==="flow"?(0,h.jsx)("section",{id:"rdr-flow-tab-host",className:"rdr-flow-tab-host","data-key":m,"data-province":o,"data-quarter":a,"data-year":Number(localStorage.getItem("rdr.year.current")||2026),"data-layer":layer},"flow:"+S+":"+layer):output==="sheet"?(0,h.jsx)("section",{id:"rdr-sheet-tab-host",className:"rdr-sheet-tab-host","data-key":m,"data-province":o,"data-quarter":a,"data-year":Number(localStorage.getItem("rdr.year.current")||2026),"data-layer":layer},"sheet:"+S+":"+layer):(0,h.jsxs)("div",{className:"mt-6 grid gap-6 lg:grid-cols-[minmax(0,420px)_minmax(0,1fr)]",children:[(0,h.jsxs)("div",{className:"rounded-[14px] border-2 border-line bg-card p-5",children:[(0,h.jsxs)("div",{className:"flex items-baseline justify-between gap-3",children:[(0,h.jsxs)("h2",{className:"font-display text-[22px] font-extrabold tracking-[-0.01em]",children:[R," \xB7 ",a," "+Number(localStorage.getItem("rdr.year.current")||2026)]}),N&&(0,h.jsx)("button",{type:"button",className:"shrink-0 font-display text-[14px] font-semibold text-rust underline-offset-4 hover:underline",onClick:()=>{setRdDr(D=>{const m={...D};delete m[S];return m});setRdPd(D=>{const m={...D};delete m[S];return m});setTimeout(()=>setRdRev(n=>n+1),60);if(layer==="total")c(C=>{let M={...C};return delete M[S],window.__rdrNirApply?window.__rdrNirApply(M):M});else setPartEdits(C=>{let M={...C},z={...(M[S]||{})};delete z[layer];Object.keys(z).length?M[S]=z:delete M[S];return M})},children:"Reset to workbook"})]}),(0,h.jsx)("p",{className:"mt-1 font-serif text-[14px] italic text-muted",children:(()=>{const src=Mr("rdr.import.history",{})[S]?.source;return src?`${o} · ${layer==="household"?"Household":layer==="establishment"?"Establishment":"Total"} · ${src.book} / ${src.sheet}, row ${src.row}`:`${o} · ${layer==="household"?"Household":layer==="establishment"?"Establishment":"Total"} · Enter estimates or import a workbook for this selection.`})()}),d.kind==="egg"?(0,h.jsx)(Gk,{v,set:P,r:g,P:d}):d.kind==="dairy"?(0,h.jsx)(Qk,{v,set:P,r:g}):(0,h.jsx)(Wk,{P:d,v,set:P,r:g,q:a,ship:rdShip,shipInc:rdShipInc}),(0,h.jsx)("section",{id:"rdr-bal-host",className:"rdr-bal-host"})]}),(0,h.jsx)("div",{className:"min-w-0",children:y?(0,h.jsxs)(h.Fragment,{children:[layer==="total"&&(hasParts||totalRecon.length>0)&&(0,h.jsxs)("div",{className:`rdr-total-recon ${totalMismatches.length?"warn":totalIncomplete.length?"incomplete":"ok"}`,children:[(0,h.jsx)("span",{className:"rdr-total-recon-eyebrow",children:"Total reconciliation"}),(0,h.jsx)("strong",{children:totalMismatches.length&&totalIncomplete.length?"Mismatches and incomplete inputs need review":totalMismatches.length?"Some Total cells do not equal Household + Establishment":totalIncomplete.length?"Some checks cannot be completed":"Household + Establishment reconciliation passed"}),(totalMismatches.length||totalIncomplete.length)>0&&(0,h.jsx)("span",{className:"rdr-total-recon-help",children:"Red = complete H/E/Total values disagree. Amber = one or more inputs needed for the comparison are blank."}),totalMismatches.length>0&&(0,h.jsxs)("div",{className:"rdr-total-recon-group",children:[(0,h.jsx)("b",{children:"Mismatch"}),(0,h.jsx)("div",{className:"rdr-total-recon-list",children:totalMismatches.map(M=>(0,h.jsxs)("span",{"data-field":M.field,"data-status":"mismatch",className:"rdr-total-recon-item mismatch",children:[M.label,": H + E = ",L(M.expected)," · Total = ",L(M.total)," · difference ",M.diff>0?"+":"",L(M.diff)]},"m-"+M.field))})]}),totalIncomplete.length>0&&(0,h.jsxs)("div",{className:"rdr-total-recon-group",children:[(0,h.jsx)("b",{children:"Incomplete inputs"}),(0,h.jsx)("div",{className:"rdr-total-recon-list",children:totalIncomplete.map(M=>(0,h.jsxs)("span",{"data-field":M.field,"data-status":"incomplete",className:"rdr-total-recon-item incomplete",children:[M.label,": cannot compare H + E with Total · incomplete ",M.missing.join(" + "),M.derived?" inputs":""]},"i-"+M.field))})]}),totalRecon.length===0&&(0,h.jsx)("span",{children:"All additive cells with complete Household, Establishment, and Total inputs reconcile."})]}),d.kind==="egg"?(0,h.jsx)(Kk,{P:d,r:g}):d.kind==="dairy"?(0,h.jsx)(qk,{P:d,r:g}):(0,h.jsx)(Yk,{r:g}),(0,h.jsxs)("div",{className:"mt-6 flex flex-wrap items-center gap-3",children:[(0,h.jsx)(C1,{n:w,label:"must fix",tone:"brick"}),(0,h.jsx)(C1,{n:T,label:"need an NRF reason",tone:"rust"}),(0,h.jsx)(Zk,{title:`${R}, ${O}`,summary:Hk(d,g),checks:p,ctx:layer==="total"?S:S+"|"+layer})]}),(0,h.jsx)(rdrCheckSections,{checks:p,ctx:layer==="total"?S:S+"|"+layer,layer})]}):(0,h.jsxs)("div",{className:"rounded-[14px] border-2 border-dashed border-line bg-card p-8",children:[(0,h.jsxs)("p",{className:"font-display text-[26px] font-extrabold leading-tight",children:["No ",layer==="household"?"household ":layer==="establishment"?"establishment ":"",R.toLowerCase()," figures for ",o==="NIR"?"the region":o," yet"]}),(0,h.jsx)("p",{className:"mt-2 text-[16px] text-muted",children:"Import S-D workbooks or type PSO estimates into the orange cells."}),(0,h.jsx)("button",{type:"button",className:"rdr-cta",onClick:()=>document.getElementById("rdr-import-launch")?.click(),children:"Import workbooks"}),E&&(E.y26||E.y25)?(0,h.jsxs)("div",{className:"mt-6 grid gap-4 sm:grid-cols-3",children:[(0,h.jsx)(om,{label:`CDSPDP ${a} ${Number(localStorage.getItem("rdr.year.current")||2026)}`,value:L(Number(localStorage.getItem("rdr.year.current")||2026)===2025?E.y25:E.y26)}),(0,h.jsx)(om,{label:`CDSPDP ${a} ${Number(localStorage.getItem("rdr.year.current")||2026)===2025?2026:2025}`,value:L(Number(localStorage.getItem("rdr.year.current")||2026)===2025?E.y26:E.y25)}),(0,h.jsx)(om,{label:"2026 vs 2025 growth",value:E.y25?`${E.y26>=E.y25?"+":""}${L((E.y26-E.y25)/E.y25*100,1)}%`:"new"})]}):null]})})]})]})}i(Uk,"SDView");function RdrProductSimulator({P,v,context,set:setDesk,layer="total",hasParts=false}){const egg=P.kind==="egg",readOnlyTotal=!1,layerLabel=layer==="household"?"Household":layer==="establishment"?"Establishment":"Total";const [scenario,setScenario]=(0,me.useState)(()=>egg?{eler:v.eler??"",pcs:v.pcs??"",days:v.days??92}:{...v});if(!egg){const fields=[["ml","Animals in milkline"],["lpd","Litres per animal per day"],["days","Days in quarter"]],calc=x=>Number(x.ml)>=0&&Number(x.lpd)>=0&&Number(x.days)>0?Number(x.ml)*Number(x.lpd)*Number(x.days):NaN,base=calc(v),value=calc(scenario),valid=fields.every(([key])=>scenario[key]!==""&&scenario[key]!=null&&Number(scenario[key])>=0)&&Number.isFinite(value);return (0,h.jsxs)("section",{className:"rdr-product-sim",children:[(0,h.jsx)("h2",{children:"Production simulator"}),(0,h.jsx)("p",{children:context+` · ${layerLabel}. Explore a scenario; imported estimates remain unchanged.`}),(0,h.jsx)("div",{className:"rdr-scenario-fields",children:fields.map(([key,label])=>(0,h.jsxs)("label",{children:[label,(0,h.jsx)("input",{type:"number",min:0,step:key==="lpd"?"any":1,value:scenario[key]??"",onChange:ev=>setScenario({...scenario,[key]:ev.target.value})})]},key))}),(0,h.jsxs)("div",{className:"rdr-scenario-results","aria-live":"polite",children:[(0,h.jsx)("p",{children:`Desk: ${Number.isFinite(base)?L(base,2):"—"} litres`}),(0,h.jsx)("strong",{children:valid?`Scenario: ${L(value,2)} litres`:"Enter valid values to calculate the scenario."}),(0,h.jsx)("p",{children:valid&&Number.isFinite(base)?`Change: ${L(value-base,2)} litres${base?` (${L((value/base-1)*100,2)}%)`:""}`:""})]}),(0,h.jsx)("button",{type:"button",onClick:()=>setScenario({...v}),children:"Reset scenario"})]})}const num=x=>x===""||x==null?NaN:Number(x),birds=Math.max(0,(Number(v.lf)||0)+(Number(v.rtl)||0)),eler=num(scenario.eler),pcs=num(scenario.pcs),days=num(scenario.days),expected=birds>0&&Number.isFinite(eler)&&eler>=0&&Number.isFinite(days)&&days>0?birds*(eler/100)*days:NaN,gap=Number.isFinite(expected)&&Number.isFinite(pcs)?pcs-expected:NaN,tol=Number.isFinite(expected)?Math.max(1,Math.abs(expected)*.005):NaN,balanced=Number.isFinite(gap)&&Math.abs(gap)<=tol,mt=Number(v.cf)>0&&Number.isFinite(pcs)?pcs/Number(v.cf)/1e3:NaN,baseExpected=birds>0&&Number(v.eler)>=0&&Number(v.days)>0?birds*(Number(v.eler)/100)*Number(v.days):NaN,baseGap=Number.isFinite(baseExpected)&&Number(v.pcs)>=0?Number(v.pcs)-baseExpected:NaN,round=(x,d=4)=>String(Math.round(x*10**d)/10**d),solve=key=>{if(key==="eler"){if(!(birds>0&&Number.isFinite(pcs)&&pcs>=0&&Number.isFinite(days)&&days>0))return;setScenario(x=>({...x,eler:round(pcs/(birds*days)*100,4)}))}else if(key==="pcs"){if(!(birds>0&&Number.isFinite(eler)&&eler>=0&&Number.isFinite(days)&&days>0))return;setScenario(x=>({...x,pcs:String(Math.round(birds*(eler/100)*days))}))}else if(key==="days"){const result=window.__rdrEggLayingDays({...v,pcs:scenario.pcs,eler:scenario.eler});if(!Number.isFinite(result))return;setScenario(x=>({...x,days:round(result,0)}))}},apply=()=>{if(!setDesk||readOnlyTotal)return;setDesk("eler",scenario.eler);setDesk("pcs",scenario.pcs);setDesk("days",scenario.days)},issues=[];birds<=0&&issues.push("No available laying flock is loaded, so the egg identity cannot be balanced."),Number.isFinite(eler)&&(eler<0||eler>100)&&issues.push("ELER must stay between 0% and 100%."),Number.isFinite(days)&&days>92&&issues.push("Required laying days exceed the desk's 92-day quarter limit."),P.eler&&Number.isFinite(eler)&&(eler<P.eler[0]||eler>P.eler[1])&&issues.push(`ELER is outside the ${P.eler[0]}–${P.eler[1]}% benchmark for this category.`);const fields=[["eler","ELER, %","0.01"],["pcs","Egg production, pieces","1"],["days","Laying days","1"]];return (0,h.jsxs)("section",{className:"rdr-product-sim rdr-egg-balancer",children:[(0,h.jsx)("h2",{children:"Egg balance simulator"}),(0,h.jsx)("p",{children:context+` · ${layerLabel}. Balance the egg identity using ELER, egg pieces, and laying days. Beginning laying flock and RTL received stay anchored to this source.`+(readOnlyTotal?" Total remains a separate reviewed value; H/E reconciliation is flagged in Review & checks.":"")}),(0,h.jsxs)("div",{className:"rdr-egg-anchor",children:[(0,h.jsxs)("span",{children:["Beginning laying flock: ",(0,h.jsx)("b",{children:L(Number(v.lf)||0)})]}),(0,h.jsxs)("span",{children:["RTL received: ",(0,h.jsx)("b",{children:L(Number(v.rtl)||0)})]}),(0,h.jsxs)("span",{children:["Available laying birds: ",(0,h.jsx)("b",{children:L(birds)})]})]}),(0,h.jsx)("div",{className:"rdr-scenario-fields",children:fields.map(([key,label,step])=>(0,h.jsxs)("label",{children:[label,(0,h.jsx)("input",{type:"number",min:0,max:key==="eler"?100:void 0,step,value:scenario[key]??"",onChange:ev=>setScenario({...scenario,[key]:key==="days"&&ev.target.value!==""?String(Math.round(Number(ev.target.value))):ev.target.value})})]},key))}),(0,h.jsxs)("div",{className:"rdr-egg-solve",children:[(0,h.jsx)("b",{children:"Let the simulator balance it"}),(0,h.jsx)("p",{children:"Choose which of the three variables should absorb the discrepancy. The other two remain fixed."}),(0,h.jsxs)("div",{className:"rdr-egg-solve-actions",children:[(0,h.jsx)("button",{type:"button",onClick:()=>solve("eler"),disabled:!(birds>0&&Number.isFinite(pcs)&&Number.isFinite(days)&&days>0),children:"Solve with ELER"}),(0,h.jsx)("button",{type:"button",onClick:()=>solve("pcs"),disabled:!(birds>0&&Number.isFinite(eler)&&Number.isFinite(days)&&days>0),children:"Solve with Egg Pieces"}),(0,h.jsx)("button",{type:"button",onClick:()=>solve("days"),disabled:!Number.isFinite(window.__rdrEggLayingDays({...v,pcs:scenario.pcs,eler:scenario.eler})),children:"Solve with Days"})]})]}),(0,h.jsxs)("div",{className:`rdr-scenario-results ${balanced?"is-balanced":"is-open"}`,"aria-live":"polite",children:[(0,h.jsx)("p",{children:`Desk formula gap: ${Number.isFinite(baseGap)?`${baseGap>=0?"+":""}${L(baseGap,0)} pieces`:"—"}`}),(0,h.jsx)("strong",{children:balanced?"Balanced":Number.isFinite(gap)?"Needs balancing":"Enter enough values to calculate the balance."}),Number.isFinite(expected)&&(0,h.jsx)("p",{children:`Expected production: ${L(expected,0)} pieces`} ),Number.isFinite(gap)&&(0,h.jsx)("p",{children:`Scenario gap: ${gap>=0?"+":""}${L(gap,0)} pieces${expected?` (${gap>=0?"+":""}${L(gap/expected*100,2)}%)`:""}`} ),Number.isFinite(mt)&&(0,h.jsx)("p",{children:`Scenario production: ${L(mt,2)} MT using the desk conversion factor (${L(Number(v.cf),2)} eggs/kg).`}),issues.length>0&&(0,h.jsx)("div",{className:"rdr-egg-issues",children:issues.map((x,i)=>(0,h.jsx)("p",{children:x},i))})]}),(0,h.jsxs)("div",{className:"rdr-egg-footer-actions",children:[(0,h.jsx)("button",{type:"button",className:"rdr-egg-apply",onClick:apply,disabled:!setDesk||readOnlyTotal||!Number.isFinite(pcs)||!Number.isFinite(days)||!Number.isFinite(eler),children:"Apply to desk"}),(0,h.jsx)("button",{type:"button",className:"rdr-egg-reset",onClick:()=>setScenario({eler:v.eler??"",pcs:v.pcs??"",days:v.days??92}),children:"Reset to desk"})]})]})}function Hk(e,t){return e.kind==="egg"?`Egg production ${L(t.pcs)} pcs, ${L(t.mt,2)} MT | laying days ${L(t.daysLaid,1)} of ${t.limit}`:e.kind==="dairy"?`Female breeders ${L(t.fb)} | milkline ${L(t.ml)} | milk ${L(t.liters)} L`:`Total supply ${L(t.ts)} | Sold live for slaughter ${L(t.soldLive)} | Production ${L(t.prodHd)} hd, ${L(t.prodMt,2)} MT LW`}i(Hk,"summaryOf");function Wk({P:e,v:t,set:n,r,q:o,ship:rdS,shipInc:rdI}){let s=e.kind==="poultry"||e.kind==="broiler";return(0,h.jsxs)(h.Fragment,{children:[(0,h.jsxs)(on,{title:"Supply",total:r.ts,children:[(0,h.jsx)($,{label:"Beginning inventory",k:"beg",v:t,set:n}),(0,h.jsx)($,{label:"Received / acquired",k:"rec",v:t,set:n}),(0,h.jsx)($,{label:s?"Hatched live":"Born live",k:"born",v:t,set:n}),e.kind==="swine"&&(0,h.jsx)($,{label:"Sows that gave birth",k:"sows",v:t,set:n}),(0,h.jsx)($,{label:"Shipped in, breeding/fattening",k:"shipIn",v:t,set:n})]}),(0,h.jsxs)(on,{title:"Disposition",children:[(0,h.jsx)($,{label:"Deaths / losses",k:"deaths",v:t,set:n}),(0,h.jsx)($,{label:"Slaughtered/dressed in HH, estab, other areas",k:"hh",v:t,set:n}),(0,h.jsx)($,{label:"Sold live for other purposes",k:"other",v:t,set:n}),(0,h.jsx)(xs,{label:"Sold live for slaughter",value:r.soldLive,bad:r.soldLive<0})]}),(0,h.jsxs)(on,{title:"End of quarter",children:[(0,h.jsx)($,{label:"Ending inventory",k:"end",v:t,set:n}),(0,h.jsx)($,{label:`Female breeders (${e.fbLabel.replace(" share","").toLowerCase()})`,k:"fb",v:t,set:n})]}),(0,h.jsxs)(on,{title:"Production",children:[(0,h.jsx)($,{label:"Average liveweight, kg",k:"alw",v:t,set:n,decimal:!0}),(0,h.jsx)(xs,{label:`Production, ${s?"birds":"heads"}`,value:r.prodHd,bad:r.prodHd<0}),(0,h.jsx)(xs,{label:"Production, MT liveweight",value:r.prodMt,digits:2})]}),(0,h.jsxs)(on,{title:"Checks against",children:[(0,h.jsx)($,{label:"Local SLH/PDP (Col 21)",k:"slh",v:t,set:n}),(0,h.jsx)($,{label:"SLH shipped in from other prov. (Col 23)",k:"slhIn",v:t,set:n}),(0,h.jsx)($,{label:"Shipped out, admin records (Col 25)",k:"shipOutAdmin",v:t,set:n,shipFlag:rdS?"mismatch":rdI?"incomplete":undefined,tooltip:window.__rdrVals?.layer!=="total"?undefined:`Expected shipped out: ${["beg","rec","born","shipIn","deaths","hh","other","end","slh"].every(f=>Number.isFinite(rdrNum(t[f])))?L(r.soldLive-rdrNum(t.slh)):"not available yet"}\nSold live for slaughter − local SLH/PDP`+(rdS?`\n\nDoes not match Household + Establishment\nTotal shows: ${L(rdS.total)}\nHousehold sold live: ${L(rdS.household)}\nEstablishment sold live: ${L(rdS.establishment)}\nLess Total local SLH/PDP: ${L(rdS.localSlh)}\nExpected from H + E: ${L(rdS.expected)}\nDifference: ${rdS.diff>0?"+":""}${L(rdS.diff)}`:rdI?`\n\nCannot compare with H + E yet\nMissing: ${rdI.missing.join(", ")}`:"")}),e.kind==="broiler"&&(0,h.jsx)($,{label:"Max housing capacity",k:"cap",v:t,set:n}),e.kind==="poultry"&&(0,h.jsx)($,{label:"Eggs for hatching, prev qtr",k:"prevHatch",v:t,set:n}),(0,h.jsx)($,{label:`Production, ${o} 2025`,k:"prevProd",v:t,set:n}),(0,h.jsx)($,{label:`Ending inventory, ${o} 2025`,k:"prevEnd",v:t,set:n}),(0,h.jsx)($,{label:`ALW, ${o} 2025`,k:"prevAlw",v:t,set:n,decimal:!0})]})]})}i(Wk,"SDLedger");function Gk({v:e,set:t,r:n,P:eggP}){return(0,h.jsxs)(h.Fragment,{children:[(0,h.jsxs)(on,{title:"Indicators",children:[(0,h.jsx)($,{label:"Beginning laying flock",k:"lf",v:e,set:t}),(0,h.jsx)($,{label:"RTL pullets received",k:"rtl",v:e,set:t}),(0,h.jsx)($,{label:"ELER, % (blank if unavailable)",k:"eler",v:e,set:t,decimal:!0}),(0,h.jsx)($,{label:"Days in quarter",k:"days",v:e,set:t})]}),(0,h.jsxs)(on,{title:"Production",children:[(0,h.jsx)($,{label:"Egg production, pieces",k:"pcs",v:e,set:t}),(0,h.jsx)($,{label:"Conversion factor, eggs/kg",k:"cf",v:e,set:t,decimal:!0}),(0,h.jsx)($,{label:"Intended for hatching, pieces",k:"hatch",v:e,set:t}),(0,h.jsx)($,{label:"Shipped out to other provinces, pieces",k:"shipOut",v:e,set:t}),(0,h.jsx)(xs,{label:"Egg production, MT",value:n.mt,digits:2})]})]})}i(Gk,"EggLedger");function Kk({P:e,r:t}){let n=t.daysLaid<=t.limit+1e-9,r=Number.isFinite(t.daysLaid)?Math.min(t.daysLaid/t.limit,1.25):0;return(0,h.jsxs)("div",{className:"rounded-[14px] bg-ink p-5 text-paper",children:[(0,h.jsx)("p",{className:"font-display text-[14px] font-semibold uppercase tracking-[0.14em] text-paper-70",children:"Days the flock would need to lay this"}),(0,h.jsxs)("div",{className:"mt-2 flex items-end gap-3 font-mono",children:[(0,h.jsx)("span",{className:`text-[64px] font-bold leading-none tracking-[-0.03em] ${n?"text-[#b9cc7a]":"text-[#ffc2bf]"}`,children:Number.isFinite(t.daysLaid)?L(t.daysLaid,1):"\u2013"}),(0,h.jsxs)("span",{className:"pb-2 text-[16px] text-paper-70",children:["of ",t.limit," allowed"]})]}),(0,h.jsxs)("div",{className:"relative mt-4 h-4 rounded-full bg-paper-10",children:[(0,h.jsx)(tt.div,{initial:!1,className:`absolute inset-y-0 left-0 rounded-full ${n?"bg-olive":"bg-brick"}`,animate:{width:`${r/1.25*100}%`},transition:{type:"spring",stiffness:140,damping:22}}),(0,h.jsx)("div",{className:"absolute -bottom-1.5 -top-1.5 w-[3px] rounded-full bg-ochre",style:{left:`${100/1.25}%`}})]}),(0,h.jsx)("p",{className:"mt-3 text-[14px] text-paper-80",children:e.mode==="native"?"Days = pieces ÷ (laying flock + RTL), adjusted by ELER/100 when supplied. Native/duck reference: 52 days.":"Days = pieces ÷ (laying flock + RTL), adjusted by ELER/100 when supplied."})]})}i(Kk,"EggHero");function Qk({v:e,set:t,r:n}){return(0,h.jsxs)(h.Fragment,{children:[(0,h.jsxs)(on,{title:"Herd",children:[(0,h.jsx)($,{label:"Total inventory (from S-D)",k:"inv",v:e,set:t}),(0,h.jsx)($,{label:"Female breeders",k:"fb",v:e,set:t}),(0,h.jsx)($,{label:"Animals in the milkline",k:"ml",v:e,set:t})]}),(0,h.jsxs)(on,{title:"Milk",children:[(0,h.jsx)($,{label:"Average milk per day, liters",k:"lpd",v:e,set:t,decimal:!0}),(0,h.jsx)($,{label:"Days in quarter",k:"days",v:e,set:t}),(0,h.jsx)(xs,{label:"Milk production, liters",value:n.liters})]})]})}i(Qk,"DairyLedger");function qk({P:e,r:t}){let n=Number.isFinite(t.mlShare)?Math.min(t.mlShare,110):0;return(0,h.jsxs)("div",{className:"rounded-[14px] bg-ink p-5 text-paper",children:[(0,h.jsxs)("p",{className:"font-display text-[14px] font-semibold uppercase tracking-[0.14em] text-paper-70",children:[e.subName," milk this quarter"]}),(0,h.jsxs)("div",{className:"mt-2 flex items-end gap-3 font-mono",children:[(0,h.jsx)("span",{className:"text-[56px] font-bold leading-none tracking-[-0.03em]",children:L(t.liters)}),(0,h.jsx)("span",{className:"pb-2 text-[16px] text-paper-70",children:"liters"})]}),(0,h.jsxs)("div",{className:"relative mt-4 h-4 rounded-full bg-paper-10",children:[(0,h.jsx)(tt.div,{initial:!1,className:`absolute inset-y-0 left-0 rounded-full ${t.ml<t.fb?"bg-olive":"bg-brick"}`,animate:{width:`${n/110*100}%`}}),(0,h.jsx)("div",{className:"absolute -bottom-1.5 -top-1.5 w-[3px] rounded-full bg-ochre",style:{left:`${100/1.1}%`}})]}),(0,h.jsx)("p",{className:"mt-3 text-[14px] text-paper-80",children:"Milkline as a share of female breeders. It has to stay left of the marker."})]})}i(qk,"DairyHero");function om({label:e,value:t}){return(0,h.jsxs)("div",{children:[(0,h.jsx)("p",{className:"font-display text-[14px] font-extrabold uppercase tracking-[0.1em] text-muted",children:e}),(0,h.jsx)("p",{className:"mt-1 font-mono text-[28px] font-bold leading-none",children:t})]})}i(om,"Stat");function on({title:e,total:t,children:n}){return(0,h.jsxs)("div",{className:"mt-5",children:[(0,h.jsxs)("div",{className:"flex items-baseline justify-between border-b-2 border-ink pb-1",children:[(0,h.jsx)("h3",{className:"font-display text-[14px] font-extrabold uppercase tracking-[0.14em]",children:e}),t!==void 0&&(0,h.jsx)("span",{className:"font-mono text-[16px] font-bold",children:L(t)})]}),(0,h.jsx)("div",{className:"divide-y divide-line",children:n})]})}i(on,"Group");function rdrMathEval(e){let t=String(e??"").trim();if(!t)return null;t=t.replace(/^=/,"").replace(/,/g,"").replace(/\s+/g,"");if(!t||!/^[0-9.+\-*/()%]+$/.test(t))return null;let n=0;const r=()=>{let e=o();for(;;){if(t[n]==="+"){n++;e+=o()}else if(t[n]==="-"){n++;e-=o()}else return e}},o=()=>{let e=s();for(;;){if(t[n]==="*"){n++;e*=s()}else if(t[n]==="/"){n++;let r=s();if(r===0)return NaN;e/=r}else return e}},s=()=>{if(t[n]==="+"){n++;return s()}if(t[n]==="-"){n++;return-s()}let e;if(t[n]==="("){n++;e=r();if(t[n]!==")")return NaN;n++}else{let r=n,d=!1;for(;n<t.length&&(/[0-9]/.test(t[n])||t[n]==="."&&!d);)t[n]==="."&&(d=!0),n++;if(r===n)return NaN;e=Number(t.slice(r,n))}for(;t[n]==="%";)e/=100,n++;return e};const a=r();return n===t.length&&Number.isFinite(a)?a:null}globalThis.__rdrMathEval=rdrMathEval;function $({label:e,k:t,v:n,set:r,decimal:o,tooltip:tip,shipFlag:flag}){const raw=(window.__rdrConsistency||[]).filter(c=>c.fields?.includes(t)&&(c.level==="error"||c.level==="flag")),issues=[...new Map(raw.map(c=>[c.id||c.title,c])).values()];if(issues.length){tip=[tip,...issues.map(c=>c.consistency?(c.level==="error"?"Hard inconsistency: ":"Plausibility warning: ")+c.title+": "+c.detail:"PSA validation: "+c.title+": "+c.detail)].filter(Boolean).join("\n\n");if(issues.some(c=>c.level==="error"))flag="mismatch";else if(!flag&&issues.some(c=>c.level==="flag"))flag="incomplete"}let cancel=(0,me.useRef)(false),[s,a]=(0,me.useState)(!1),[d,m]=(0,me.useState)(""),l=n[t]??"",u=_e(l),c=s?d:l===""||Number.isNaN(u)?l:o?L(u,2):L(u,Number.isInteger(u)?0:2),f=`f-${t}`,x=()=>{if(cancel.current){cancel.current=false;m(String(l));a(!1);return}let e=d.trim();if(e===""){r(t,"");a(!1);return}let n=rdrMathEval(e);n!==null&&n<0?(window.__rdrFlash&&window.__rdrFlash("Negative values are not allowed here. The previous value was kept.")):n!==null?r(t,String(n)):(window.__rdrFlash?window.__rdrFlash("Invalid formula. The previous value was kept."):null),a(!1)};return(0,h.jsxs)("div",{className:`flex items-center justify-between gap-3 py-1.5 ${tip?"rdr-admin-tip":""}`,children:[(0,h.jsx)("label",{htmlFor:f,className:"min-w-0 text-[14px] leading-tight",children:e}),(0,h.jsx)("input",{id:f,"aria-describedby":tip?f+"-tip":undefined,inputMode:"decimal",value:c,placeholder:"0 or =100+25",title:"Enter a value or formula, e.g. =100+25",onFocus:()=>{m(String(l).replace(/,/g,""));a(!0)},onBlur:x,onKeyDown:e=>{e.key==="Enter"&&(e.preventDefault(),e.currentTarget.blur()),e.key==="Escape"&&(e.preventDefault(),cancel.current=true,e.currentTarget.blur())},onChange:e=>m(e.target.value),className:`cell w-[148px] shrink-0 rounded-[6px] px-2 py-1.5 text-right font-mono text-[16px] font-semibold ${flag==="mismatch"?"rdr-admin-mismatch":flag==="incomplete"?"rdr-admin-incomplete":""}`}),tip&&(0,h.jsx)("span",{id:f+"-tip",role:"tooltip",className:"rdr-shipped-tooltip",children:tip})]})}i($,"Cell");function xs({label:e,value:t,bad:n,digits:r=0,incomplete:inc=false,tooltip:tip}){return(0,h.jsxs)("div",{className:"flex items-center justify-between gap-3 py-1.5",children:[(0,h.jsx)("span",{className:"text-[14px] font-semibold leading-tight",children:e}),(0,h.jsxs)(tt.span,{initial:{scale:.96},animate:{scale:1},tabIndex:tip?0:undefined,"aria-label":tip?`${e}: ${L(t,r)}. ${tip}`:undefined,className:`w-[148px] shrink-0 px-2 py-1.5 text-right font-mono text-[16px] font-bold ${tip?"rdr-shipped-tip ":""}${n?"rounded-[6px] bg-brick text-paper":inc?"rdr-shipped-incomplete":"text-olive"}`,children:[L(t,r),tip&&(0,h.jsx)("span",{role:"tooltip",className:"rdr-shipped-tooltip",children:tip})]},Math.sign(t))]})}i(xs,"Derived");var E1=[{k:"deaths",label:"Deaths",c:"#b04948"},{k:"hh",label:"HH/estab slaughter",c:"#c88a2c"},{k:"local",label:"Local SLH/PDP",c:"#4c6216"},{k:"ship",label:"Shipped out",c:"#8fa34f"},{k:"other",label:"Sold other purposes",c:"#9e4013"},{k:"end",label:"Ending inventory",c:"#3d7a52"}];function Yk({r:e}){if(!Number.isFinite(e.soldLive))return null;let t=Math.max(e.soldLive,0),n=Math.min(t,e.slh),r=Math.max(t-n,0),o={deaths:e.deaths,hh:e.hh,local:n,ship:r,other:e.other,end:e.end},s=Object.values(o).reduce((c,f)=>c+f,0),a=Math.max(e.ts,s,1),l=Math.max(s-e.ts,0),u=e.soldLive>=0;return(0,h.jsxs)("div",{className:"rounded-[14px] bg-ink p-5 text-paper",children:[(0,h.jsxs)("div",{className:"flex flex-wrap items-baseline justify-between gap-2",children:[(0,h.jsx)("p",{className:"font-display text-[14px] font-semibold uppercase tracking-[0.14em] text-paper-70",children:"Where the supply went"}),(0,h.jsx)("p",{className:`font-display text-[16px] font-extrabold ${u?"text-[#b9cc7a]":"text-[#ffc2bf]"}`,children:u?"Balanced S-D":`Unbalanced by ${L(l)}`})]}),(0,h.jsxs)("div",{className:"mt-3 flex items-end justify-between font-mono",children:[(0,h.jsx)("span",{className:"text-[14px] text-paper-70",children:"Total supply"}),(0,h.jsx)("span",{className:"text-[30px] font-bold leading-none tracking-[-0.02em]",children:L(e.ts)})]}),(0,h.jsxs)("div",{className:"relative mt-3 h-14",children:[(0,h.jsx)("div",{className:"absolute inset-y-0 left-0 rounded-[6px] bg-paper-10",style:{width:`${e.ts/a*100}%`}}),(0,h.jsx)("div",{className:"absolute inset-0 flex overflow-hidden rounded-[6px]",children:E1.map(c=>(0,h.jsx)(tt.div,{initial:!1,className:"h-full shrink-0 border-r border-ink-40 last:border-r-0",style:{background:c.c},animate:{width:`${o[c.k]/a*100}%`},transition:{type:"spring",stiffness:160,damping:24},title:`${c.label}: ${L(o[c.k])}`},c.k))}),l>0&&(0,h.jsx)(tt.div,{className:"hatch absolute inset-y-0 rounded-r-[6px]",initial:{opacity:0},animate:{opacity:1,left:`${e.ts/a*100}%`,width:`${l/a*100}%`}}),(0,h.jsx)(tt.div,{initial:!1,className:"absolute -bottom-2 -top-2 w-[3px] rounded-full bg-ochre",animate:{left:`calc(${e.ts/a*100}% - 1.5px)`}})]}),(0,h.jsx)("div",{className:"mt-4 grid grid-cols-2 gap-x-4 gap-y-1.5 sm:grid-cols-3",children:E1.map(c=>(0,h.jsxs)("div",{className:"flex items-center justify-between gap-2 text-[14px]",children:[(0,h.jsxs)("span",{className:"flex min-w-0 items-center gap-2",children:[(0,h.jsx)("i",{className:"h-3 w-3 shrink-0 rounded-[3px]",style:{background:c.c}}),(0,h.jsx)("span",{className:"truncate text-paper-80",children:c.label})]}),(0,h.jsx)("span",{className:"font-mono font-semibold",children:L(o[c.k])})]},c.k))})]})}i(Yk,"FlowStrip");function C1({n:e,label:t,tone:n}){return(0,h.jsxs)("span",{className:`inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[14px] font-semibold ${e?`${n==="brick"?"bg-brick":"bg-rust"} text-paper`:"bg-olive-15 text-olive"}`,children:[(0,h.jsx)("span",{className:"font-mono text-[16px] font-bold",children:e}),t]})}i(C1,"Tally");function Xk({x:e,ctx:d}){let[t,n]=e.range,r=n-t||1,o=e.value,s=Number.isFinite(o),a=Math.max(0,Math.min(s?o:t,t-r*.8)),l=Math.max(s?o:n,n+r*.8),u=i(f=>(f-a)/(l-a)*100,"pos"),c=e.level==="ok"?"#4c6216":e.level==="error"?"#b04948":e.level==="flag"?"#9e4013":"#7a8270",m=e.digits??1,p=`${d||"global"}::${e.id||e.label||"reason"}`,[g,y]=(0,me.useState)("");(0,me.useEffect)(()=>{if(e.level!=="flag")return;try{let f=JSON.parse(localStorage.getItem("rdr.reason.comments")||"{}");y(f[p]||"")}catch{y("")}},[p,e.level]);let v=i(()=>{try{let f=JSON.parse(localStorage.getItem("rdr.reason.comments")||"{}");g.trim()?f[p]=g:delete f[p],localStorage.setItem("rdr.reason.comments",JSON.stringify(f)),window.__rdrCommentNote&&window.__rdrCommentNote(p,g,e.label)}catch{window.alert("This comment could not be saved. Copy your text before closing and check browser storage.")}},"saveRailReasonComment");return(0,h.jsxs)("div",{className:"rounded-[12px] border-2 border-line bg-card p-3",children:[(0,h.jsxs)("div",{className:"flex items-baseline justify-between gap-2",children:[(0,h.jsxs)("div",{children:[(0,h.jsx)("p",{className:"font-display text-[14px] font-extrabold uppercase tracking-[0.1em]",children:e.label}),e.origin&&(0,h.jsx)("span",{className:"rdr-origin rdr-origin-"+e.originKey,style:{marginTop:4},children:e.origin})]}),(0,h.jsx)("p",{className:"font-mono text-[22px] font-bold leading-none",style:{color:c},children:s?L(o,m):"\u2013"})]}),(0,h.jsxs)("div",{className:"relative mt-4 h-3 rounded-full bg-line",children:[(0,h.jsx)("div",{className:"absolute inset-y-0 rounded-full bg-olive-35",style:{left:`${u(t)}%`,width:`${u(n)-u(t)}%`}}),s&&(0,h.jsx)(tt.div,{className:"absolute top-1/2 h-5 w-5 -translate-x-1/2 -translate-y-1/2 rounded-full border-[3px] border-card shadow",style:{background:c},initial:!1,animate:{left:`${Math.min(Math.max(u(o),0),100)}%`},transition:{type:"spring",stiffness:200,damping:22}})]}),(0,h.jsxs)("div",{className:"mt-1.5 flex justify-between font-mono text-[14px] text-muted",children:[(0,h.jsx)("span",{children:e.unit}),(0,h.jsxs)("span",{children:["ok ",L(t,m)," to ",L(n,m)]})]}),(0,h.jsx)("p",{className:"mt-2 text-[14px] leading-snug",children:s||e.id==="alw"?e.note:"Can't compute yet: a cell this ratio needs is blank."}),rdFixBtns(e.fixes),e.level==="flag"&&(0,h.jsxs)("div",{className:"mt-3 border-t border-rust/20 pt-3",children:[(0,h.jsx)("label",{className:"block font-display text-[13px] font-bold text-rust",children:"Your comment / explanation"}),(0,h.jsx)("textarea",{value:g,onChange:f=>y(f.target.value),onBlur:v,rows:2,placeholder:"Reason, source or event for this result",className:"mt-1 w-full resize-y rounded-[8px] border-2 border-rust/30 bg-paper px-3 py-2 text-[14px] leading-snug text-ink outline-none focus:border-rust"}),(0,h.jsxs)("div",{className:"mt-1 flex items-center gap-2",style:{justifyContent:"flex-end"},children:[(0,h.jsx)("button",{type:"button",onClick:v,className:"rounded-[7px] border border-rust px-2.5 py-1 text-[12px] font-bold text-rust hover:bg-rust-10",children:"Save comment"})]})]})]})}i(Xk,"Rail");function sm({x:e,ctx:a}){let t={ok:"border-olive-40 bg-olive-10",info:"border-line bg-card",flag:"border-rust bg-rust-10",error:"border-brick bg-brick-10"},n={ok:"OK",info:"Note",flag:"Reason",error:"Fix"}[e.level],r={ok:"bg-olive",info:"bg-muted",flag:"bg-rust",error:"bg-brick"}[e.level],o=`${a||"global"}::${e.id||e.title||e.label||"reason"}`,[s,l]=(0,me.useState)("");(0,me.useEffect)(()=>{if(e.level!=="flag")return;try{let u=JSON.parse(localStorage.getItem("rdr.reason.comments")||"{}");l(u[o]||"")}catch{l("")}},[o,e.level]);let c=i(()=>{try{let u=JSON.parse(localStorage.getItem("rdr.reason.comments")||"{}");s.trim()?u[o]=s:delete u[o],localStorage.setItem("rdr.reason.comments",JSON.stringify(u)),window.__rdrCommentNote&&window.__rdrCommentNote(o,s,e.title)}catch{window.alert("This comment could not be saved. Copy your text before closing and check browser storage.")}},"saveReasonComment");return(0,h.jsxs)(tt.div,{layout:!0,initial:{opacity:0,y:6},animate:{opacity:1,y:0},exit:{opacity:0},className:`flex gap-3 rounded-[12px] border-2 p-3 ${t[e.level]}`,children:[(0,h.jsx)("span",{className:`h-fit shrink-0 rounded-[6px] px-2 py-0.5 font-mono text-[14px] font-bold text-paper ${r}`,children:n}),(0,h.jsxs)("div",{className:"min-w-0 flex-1",children:[(0,h.jsxs)("div",{className:"rdr-card-head",children:[(0,h.jsx)("p",{className:"font-display text-[16px] font-semibold leading-tight",children:e.title}),e.origin&&(0,h.jsx)("span",{className:"rdr-origin rdr-origin-"+e.originKey,children:e.origin})]}),(0,h.jsx)("p",{className:"mt-1 text-[14px] leading-snug text-ink-80",style:{whiteSpace:"pre-line"},children:e.detail}),rdFixBtns(e.fixes),e.stats?.length>0&&(0,h.jsx)("p",{className:"mt-2 font-mono text-[14px] font-semibold",children:e.stats.join("  \xB7  ")}),e.items&&(0,h.jsx)("ul",{className:"mt-2 grid gap-x-6 gap-y-1 sm:grid-cols-2",children:e.items.map(u=>(0,h.jsxs)("li",{className:"flex gap-2 font-mono text-[14px] font-semibold",children:[(0,h.jsx)("span",{className:"text-brick",children:"\u25AA"}),u]},u))}),e.level==="flag"&&(0,h.jsxs)("div",{className:"mt-3 border-t border-rust/20 pt-3",children:[(0,h.jsx)("label",{className:"block font-display text-[13px] font-bold text-rust",children:"Your comment / explanation"}),(0,h.jsx)("textarea",{value:s,onChange:u=>l(u.target.value),onBlur:c,rows:2,placeholder:"Reason, source or event for this result",className:"mt-1 w-full resize-y rounded-[8px] border-2 border-rust/30 bg-paper px-3 py-2 text-[14px] leading-snug text-ink outline-none focus:border-rust"}),(0,h.jsxs)("div",{className:"mt-1 flex items-center gap-2",style:{justifyContent:"flex-end"},children:[(0,h.jsx)("button",{type:"button",onClick:c,className:"rounded-[7px] border border-rust px-2.5 py-1 text-[12px] font-bold text-rust hover:bg-rust-10",children:"Save comment"})]})]})]})]})}i(sm,"Card");function Zk({title:e,summary:t,checks:n,ctx:r}){let[o,s]=(0,me.useState)(!1),a=i(()=>{let l={};try{l=JSON.parse(localStorage.getItem("rdr.reason.comments")||"{}")}catch{}return[`${e} (RDR notes)`,t,...n.filter(u=>u.level==="error"||u.level==="flag").map(u=>{let c=`${r||"global"}::${u.id||u.title||u.label||"reason"}`,f=u.level==="flag"&&l[c]?`\n  Your comment: ${l[c]}`:"";return`- [${u.consistency||u.id==="shiphe"?"INTERNAL":"PSA"}] [${u.level==="error"?"FIX":"REASON"}] ${u.title||u.label}: ${String(u.detail||u.note||"").replace(/\n/g,"; ")}${u.items?`\n    `+u.items.join(`\n    `):""}${f}`})].join(`\n`)},"text");return(0,h.jsx)("button",{type:"button",onClick:i(async()=>{let l=a();try{await navigator.clipboard.writeText(l)}catch{let u=document.createElement("textarea");u.value=l,document.body.appendChild(u),u.select();try{document.execCommand("copy")}catch{}u.remove()}s(!0),setTimeout(()=>s(!1),1600)},"copy"),className:"ml-auto rounded-full border-2 border-ink px-4 py-1.5 font-display text-[14px] font-semibold transition hover:bg-ink hover:text-paper",children:o?"Copied \u2713":"Copy RDR notes"})}i(Zk,"CopyNotes");var Jk=["Carabao","Cattle","Hog","Goat","Sheep","Horse","Rabbit","Chicken","Broiler","Layer","Native/Improved","Duck","Quail","Turkey","Goose"],e5=new Set(["Broiler","Layer","Native/Improved"]),T1=(()=>{let e=["Negros Occidental","Bacolod City","Negros Oriental","Siquijor","NIR"];try{let t=JSON.parse(localStorage.getItem("rdr.import.provinces")||"[]");return[...new Set([...e,...(Array.isArray(t)?t:[])])]}catch{return e}})(),t5=i((e,t)=>t?(e-t)/t*100:NaN,"g");function n5(){return(0,h.jsx)("section",{className:"mx-auto max-w-[1240px] px-6 pt-6",children:(0,h.jsx)("div",{id:"rdr-narrative-host"})})}i(n5,"NarrativeReportView");function r5({x:e,dark:t,a:a,p:p}){const yr=Number(localStorage.getItem("rdr.year.current")||2026),cur=yr===2025?e?.y25:e?.y26,prev=yr===2026?e?.y25:null,nb={"data-slh":a+"|"+p,tabIndex:0,role:"button","aria-label":"Add a note for "+(a==="Hog"?"Swine":a)+" in "+p};if(!e||cur==null)return(0,h.jsx)("td",{...nb,"data-y25":e?.y25??"","data-y26":e?.y26??"","data-yoy":"",className:"px-4 py-3 text-right font-mono text-[16px] text-muted",children:"\u2013"});let n=prev!=null?t5(cur,prev):NaN,r=Number.isFinite(n)&&Math.abs(n)>=20,o=prev==null&&cur>0;return(0,h.jsxs)("td",{...nb,"data-y25":e.y25??"","data-y26":e.y26??"","data-yoy":Number.isFinite(n)?n:"","data-swing":r?"1":void 0,className:`px-4 py-3 text-right align-top ${t?"bg-olive-10":""}`,children:[(0,h.jsx)("div",{className:"font-mono text-[16px] font-bold",children:L(cur)}),(0,h.jsx)("div",{className:`mt-0.5 font-mono text-[14px] ${o?"text-muted":r?"font-bold text-rust":"text-muted"}`,children:yr===2025?"2025 selected":Number.isFinite(n)?`${n>=0?"+":""}${L(n,1)}%`:"\u2013"})]})}i(r5,"GCell");function o5(){let[e,t]=(0,me.useState)(()=>Mr("rdr.check",{}));(0,me.useEffect)(()=>_o("rdr.check",e),[e]);let n=tm.flatMap(o=>o.items),r=n.filter(o=>e[o]).length;return(0,h.jsx)("section",{className:"mx-auto max-w-[1240px] px-6 pt-6",children:(0,h.jsxs)("div",{className:"grid gap-6 lg:grid-cols-[minmax(0,1fr)_340px]",children:[(0,h.jsxs)("div",{children:[(0,h.jsxs)("div",{className:"flex items-end justify-between gap-4",children:[(0,h.jsx)("h2",{className:"font-display text-[34px] font-extrabold leading-none tracking-[-0.02em]",children:"Ready for the RDR?"}),(0,h.jsxs)("p",{className:"font-mono text-[22px] font-bold text-olive",children:[r,"/",n.length]})]}),(0,h.jsx)("div",{className:"mt-3 h-2 overflow-hidden rounded-full bg-line",children:(0,h.jsx)(tt.div,{className:"h-full bg-olive",animate:{width:`${r/n.length*100}%`}})}),(0,h.jsx)("div",{className:"mt-6 grid gap-5 md:grid-cols-2",children:tm.map(o=>(0,h.jsxs)("div",{className:"rounded-[14px] border-2 border-line bg-card p-4",children:[(0,h.jsx)("h3",{className:"font-display text-[14px] font-extrabold uppercase tracking-[0.14em]",children:o.group}),(0,h.jsx)("ul",{className:"mt-2",children:o.items.map(s=>(0,h.jsx)("li",{children:(0,h.jsxs)("label",{className:"flex cursor-pointer gap-3 rounded-[8px] px-1 py-2 hov-olive",children:[(0,h.jsx)("input",{type:"checkbox",className:"tick mt-0.5",checked:!!e[s],onChange:()=>t(a=>({...a,[s]:!a[s]}))}),(0,h.jsx)("span",{className:`text-[14px] leading-snug ${e[s]?"text-muted line-through":""}`,children:s})]})},s))})]},o.group))}),(0,h.jsx)("button",{type:"button",onClick:()=>t({}),className:"mt-4 font-display text-[14px] font-semibold text-rust underline-offset-4 hover:underline",children:"Reset checklist"})]}),(0,h.jsxs)("aside",{className:"h-fit rounded-[14px] bg-ink p-5 text-paper",children:[(0,h.jsx)("p",{className:"font-display text-[14px] font-semibold uppercase tracking-[0.14em] text-ochre",children:"Q3 milestones"}),(0,h.jsx)("ol",{className:"mt-3",children:h1.map((o,s)=>(0,h.jsxs)("li",{className:"relative border-l-2 border-paper-20 pb-4 pl-4 last:pb-0",children:[(0,h.jsx)("span",{className:`absolute -left-[7px] top-1 h-3 w-3 rounded-full ${s===1?"bg-ochre":"bg-paper-40"}`}),(0,h.jsx)("p",{className:"font-mono text-[14px] font-bold text-paper-70",children:o.d}),(0,h.jsx)("p",{className:`text-[16px] ${s===1?"font-semibold text-ochre":""}`,children:o.t})]},o.t))}),(0,h.jsx)("p",{className:"mt-4 font-serif text-[14px] italic text-paper-70",children:"Dates from the 2025 manual timetable. LPSD updates them by memo, so confirm this year's schedule."})]})]})})}i(o5,"ChecklistView");var lm=_(Mt());globalThis.__ARTIFACT_BUILD__??=1791947330722;var A1=document.getElementById("root");if(!A1)throw new Error("Artifact root element is missing.");(0,b1.createRoot)(A1).render((0,lm.jsx)(N1.Suspense,{fallback:null,children:(0,lm.jsx)(am,{})}));})();
 </script>
 <!-- RDR Desk Excel workbook importer -->
 <script id="rdr-bundled-xlsx">
@@ -5716,9 +6010,200 @@ Failed: ${failures.slice(0,5).join(' | ')}${failures.length>5?' …':''}`:''}`);
  };
  // --------------------------------------------------------------------------------------------
 
+/* ---- Excel sheet tab: read cell formatting from the cached .xlsx (fonts, fills, borders, alignment,
+   number formats, column widths, row heights, hidden rows/columns, gridlines). Parsed lazily per sheet. ---- */
+const RDR_INDEXED = ["000000","FFFFFF","FF0000","00FF00","0000FF","FFFF00","FF00FF","00FFFF","000000","FFFFFF","FF0000","00FF00","0000FF","FFFF00","FF00FF","00FFFF","800000","008000","000080","808000","800080","008080","C0C0C0","808080","9999FF","993366","FFFFCC","CCFFFF","660066","FF8080","0066CC","CCCCFF","000080","FF00FF","FFFF00","00FFFF","800080","800000","008080","0000FF","00CCFF","CCFFFF","CCFFCC","FFFF99","99CCFF","FF99CC","CC99FF","FFCC99","3366FF","33CCCC","99CC00","FFCC00","FF9900","FF6600","666699","969696","003366","339966","003300","333300","993300","993366","333399","333333"];
+const RDR_BUILTIN_FMT = { 0: "General", 1: "0", 2: "0.00", 3: "#,##0", 4: "#,##0.00", 9: "0%", 10: "0.00%", 11: "0.00E+00", 12: "# ?/?", 13: "# ??/??", 14: "mm-dd-yy", 15: "d-mmm-yy", 16: "d-mmm", 17: "mmm-yy", 18: "h:mm AM/PM", 19: "h:mm:ss AM/PM", 20: "h:mm", 21: "h:mm:ss", 22: "m/d/yy h:mm", 37: "#,##0 ;(#,##0)", 38: "#,##0 ;[Red](#,##0)", 39: "#,##0.00;(#,##0.00)", 40: "#,##0.00;[Red](#,##0.00)", 45: "mm:ss", 46: "[h]:mm:ss", 47: "mmss.0", 48: "##0.0E+0", 49: "@" };
+const __rdrStyleCache = new Map();
+function rdrTintColor(hex, tint) {
+  tint = Number(tint);
+  if (!hex || !Number.isFinite(tint) || tint === 0) return hex;
+  const n = parseInt(hex.slice(1), 16);
+  let r = ((n >> 16) & 255) / 255, g = ((n >> 8) & 255) / 255, b = (n & 255) / 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+  let h = 0, s = 0, l = (mx + mn) / 2;
+  if (mx !== mn) {
+    const d = mx - mn;
+    s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+    h = mx === r ? (g - b) / d + (g < b ? 6 : 0) : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    h /= 6;
+  }
+  l = tint < 0 ? l * (1 + tint) : l * (1 - tint) + tint;
+  l = Math.min(1, Math.max(0, l));
+  const f = (p, q, t) => {
+    if (t < 0) t += 1;
+    if (t > 1) t -= 1;
+    return t < 1 / 6 ? p + (q - p) * 6 * t : t < 1 / 2 ? q : t < 2 / 3 ? p + (q - p) * (2 / 3 - t) * 6 : p;
+  };
+  let R, G, B;
+  if (s === 0) R = G = B = l;
+  else {
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s, p = 2 * l - q;
+    R = f(p, q, h + 1 / 3); G = f(p, q, h); B = f(p, q, h - 1 / 3);
+  }
+  const x = (v) => Math.round(v * 255).toString(16).padStart(2, "0");
+  return "#" + x(R) + x(G) + x(B);
+}
+async function rdrLoadStyleParts(zip) {
+  const dec = new TextDecoder("utf-8"),
+    get = async (p) => { const b = await rdrZipEntry(zip, p); return b ? rdrXml(dec.decode(b)) : null; },
+    all = (d, n) => (d ? Array.from(d.getElementsByTagNameNS("*", n)) : []),
+    kids = (el, n) => Array.from(el.children || []).filter((k) => k.localName === n),
+    flag = (el) => !!el && el.getAttribute("val") !== "0" && el.getAttribute("val") !== "false";
+  // theme colours, indexed by SpreadsheetML theme index (0=lt1, 1=dk1, 2=lt2, 3=dk2, accents, links)
+  const theme = [];
+  const th = await get("xl/theme/theme1.xml");
+  const scheme = all(th, "clrScheme")[0];
+  if (scheme) {
+    const order = Array.from(scheme.children).map((c) => {
+      const k = c.firstElementChild;
+      return k ? "#" + (k.getAttribute("val") && k.localName === "srgbClr" ? k.getAttribute("val") : k.getAttribute("lastClr") || "000000") : "#000000";
+    });
+    if (order.length >= 4) [order[0], order[1], order[2], order[3]] = [order[1], order[0], order[3], order[2]];
+    theme.push(...order);
+  }
+  const color = (el) => {
+    if (!el) return null;
+    let hex = null;
+    if (el.getAttribute("rgb")) hex = "#" + el.getAttribute("rgb").slice(-6);
+    else if (el.getAttribute("theme") != null) hex = theme[+el.getAttribute("theme")] || null;
+    else if (el.getAttribute("indexed") != null) { const i = +el.getAttribute("indexed"); hex = i === 64 ? "#000000" : i === 65 ? "#FFFFFF" : "#" + (RDR_INDEXED[i] || "000000"); }
+    return hex ? rdrTintColor(hex, el.getAttribute("tint")) : null;
+  };
+  const st = await get("xl/styles.xml");
+  const numFmts = new Map();
+  for (const n of all(st, "numFmt")) numFmts.set(+n.getAttribute("numFmtId"), n.getAttribute("formatCode"));
+  const fontsEl = all(st, "fonts")[0], fillsEl = all(st, "fills")[0], bordersEl = all(st, "borders")[0], xfsEl = all(st, "cellXfs")[0];
+  const fonts = fontsEl ? kids(fontsEl, "font").map((f) => ({
+    b: flag(kids(f, "b")[0]), i: flag(kids(f, "i")[0]), strike: flag(kids(f, "strike")[0]),
+    u: kids(f, "u")[0] ? kids(f, "u")[0].getAttribute("val") || "single" : null,
+    sz: kids(f, "sz")[0] ? +kids(f, "sz")[0].getAttribute("val") : null,
+    name: kids(f, "name")[0] ? kids(f, "name")[0].getAttribute("val") : null,
+    color: color(kids(f, "color")[0]),
+  })) : [];
+  const fills = fillsEl ? kids(fillsEl, "fill").map((f) => {
+    const p = kids(f, "patternFill")[0];
+    if (!p) return null;
+    const t = p.getAttribute("patternType");
+    return t === "solid" ? color(kids(p, "fgColor")[0]) : null;
+  }) : [];
+  const bw = { thin: "1px solid", medium: "2px solid", thick: "3px solid", dashed: "1px dashed", dotted: "1px dotted", double: "3px double", hair: "1px dotted", mediumDashed: "2px dashed", dashDot: "1px dashed", mediumDashDot: "2px dashed", dashDotDot: "1px dashed", mediumDashDotDot: "2px dashed", slantDashDot: "2px dashed" };
+  const borders = bordersEl ? kids(bordersEl, "border").map((b) => {
+    const o = {};
+    for (const [k, side] of [["left", "l"], ["right", "r"], ["top", "t"], ["bottom", "b"]]) {
+      const e = kids(b, k)[0], style = e && e.getAttribute("style");
+      if (style && bw[style]) o[side] = bw[style] + " " + (color(kids(e, "color")[0]) || "#000000");
+    }
+    return o;
+  }) : [];
+  const xfs = xfsEl ? kids(xfsEl, "xf").map((x) => {
+    const fid = +(x.getAttribute("fontId") || 0), f = fonts[fid] || {}, al = kids(x, "alignment")[0];
+    const nid = +(x.getAttribute("numFmtId") || 0);
+    const css = [];
+    css.push(`font-family:${f.name ? `'${f.name.replace(/'/g, "")}',` : ""}Arial,Helvetica,sans-serif`);
+    css.push(`font-size:${((f.sz || 11) * 96 / 72).toFixed(2)}px`);
+    if (f.b) css.push("font-weight:700");
+    if (f.i) css.push("font-style:italic");
+    const deco = [f.u ? "underline" : "", f.strike ? "line-through" : ""].filter(Boolean).join(" ");
+    if (deco) css.push("text-decoration:" + deco);
+    if (f.color) css.push("color:" + f.color);
+    const fill = fills[+(x.getAttribute("fillId") || 0)];
+    if (fill) css.push("background-color:" + fill);
+    const ha = al && al.getAttribute("horizontal"), va = al && al.getAttribute("vertical");
+    if (ha === "left" || ha === "right" || ha === "justify") css.push("text-align:" + ha);
+    else if (ha === "center" || ha === "centerContinuous") css.push("text-align:center");
+    css.push("vertical-align:" + (va === "center" ? "middle" : va === "top" ? "top" : "bottom"));
+    const wrap = !!al && (al.getAttribute("wrapText") === "1" || al.getAttribute("wrapText") === "true");
+    const ind = al && +al.getAttribute("indent");
+    if (ind) css.push(`padding-${ha === "right" ? "right" : "left"}:${3 + ind * 9}px`);
+    return {
+      css: css.join(";"), wrap, fill: !!fill, ha: ha || "general", va: va || "bottom",
+      rot: al ? +al.getAttribute("textRotation") || 0 : 0,
+      fmt: numFmts.has(nid) ? numFmts.get(nid) : RDR_BUILTIN_FMT[nid] || "General",
+      b: borders[+(x.getAttribute("borderId") || 0)] || {},
+    };
+  }) : [];
+  const dxfsEl = all(st, "dxfs")[0];
+  const dxfs = dxfsEl ? kids(dxfsEl, "dxf").map((d) => {
+    const o = {}, f = kids(d, "font")[0], fl = kids(d, "fill")[0];
+    if (f) {
+      if (kids(f, "b")[0]) o.b = flag(kids(f, "b")[0]);
+      if (kids(f, "i")[0]) o.i = flag(kids(f, "i")[0]);
+      if (kids(f, "u")[0]) o.u = true;
+      if (kids(f, "strike")[0]) o.strike = flag(kids(f, "strike")[0]);
+      const c = color(kids(f, "color")[0]);
+      if (c) o.color = c;
+    }
+    if (fl) {
+      const p = kids(fl, "patternFill")[0];
+      if (p) { const bg = color(kids(p, "bgColor")[0]), fg = color(kids(p, "fgColor")[0]); if (bg || fg) o.bg = bg || fg; }
+    }
+    return o;
+  }) : [];
+  return { xfs, dxfs };
+}
+async function rdrReadSheetStyle(book, sheetName) {
+  const key = [book.name, sheetName, book.buffer?.byteLength || 0].join("|");
+  if (__rdrStyleCache.has(key)) return __rdrStyleCache.get(key);
+  const zip = await rdrZipIndex(book.buffer),
+    dec = new TextDecoder("utf-8"),
+    get = async (p) => { const b = await rdrZipEntry(zip, p); return b ? rdrXml(dec.decode(b)) : null; },
+    wb = await get("xl/workbook.xml"),
+    rels = rdrRelMap(await get("xl/_rels/workbook.xml.rels")),
+    el = Array.from(wb.getElementsByTagNameNS("*", "sheet")).find((s) => s.getAttribute("name") === sheetName);
+  if (!el) return null;
+  const rid = el.getAttribute("r:id") || el.getAttributeNS("http://schemas.openxmlformats.org/officeDocument/2006/relationships", "id"),
+    doc = await get(rdrPath("xl/workbook.xml", rels.get(rid).target)),
+    parts = await rdrLoadStyleParts(zip),
+    first = (n) => doc.getElementsByTagNameNS("*", n)[0],
+    all = (n) => Array.from(doc.getElementsByTagNameNS("*", n)),
+    colIdx = (ref) => { let c = 0; for (const ch of ref.replace(/\d+/g, "").toUpperCase()) c = c * 26 + ch.charCodeAt(0) - 64; return c - 1; };
+  const fmtPr = first("sheetFormatPr"), view = first("sheetView");
+  const defRowPt = fmtPr && fmtPr.getAttribute("defaultRowHeight") ? +fmtPr.getAttribute("defaultRowHeight") : 15,
+    defColW = fmtPr && fmtPr.getAttribute("defaultColWidth") ? +fmtPr.getAttribute("defaultColWidth") : (fmtPr && +fmtPr.getAttribute("baseColWidth") || 8) + 0.43;
+  const out = {
+    xfs: parts.xfs, dxfs: parts.dxfs, cf: [],
+    defaultRowPx: Math.round(defRowPt * 96 / 72 * 100) / 100,
+    defaultColPx: Math.round(defColW * 7 + 5),
+    showGrid: !(view && view.getAttribute("showGridLines") === "0"),
+    cols: [], rows: {}, cells: {}, special: {},
+  };
+  for (const c of all("col")) {
+    const w = c.getAttribute("width");
+    out.cols.push({ min: +c.getAttribute("min") - 1, max: +c.getAttribute("max") - 1, px: w != null ? Math.round(+w * 7 + 5) : null, hidden: c.getAttribute("hidden") === "1" || c.getAttribute("hidden") === "true", s: c.getAttribute("style") != null ? +c.getAttribute("style") : null });
+  }
+  for (const r of all("row")) {
+    const ri = +r.getAttribute("r") - 1, o = {};
+    if (r.getAttribute("ht") != null) o.h = Math.round(+r.getAttribute("ht") * 96 / 72 * 100) / 100;
+    if (r.getAttribute("hidden") === "1" || r.getAttribute("hidden") === "true") o.hidden = true;
+    if (r.getAttribute("s") != null && (r.getAttribute("customFormat") === "1" || r.getAttribute("customFormat") === "true")) o.s = +r.getAttribute("s");
+    if (Object.keys(o).length) out.rows[ri] = o;
+  }
+  for (const c of all("c")) {
+    const ref = c.getAttribute("r"), ri = +ref.replace(/\D/g, "") - 1, ci = colIdx(ref), k = ri + "|" + ci;
+    if (c.getAttribute("s")) out.cells[k] = +c.getAttribute("s");
+    const t = c.getAttribute("t"), v = Array.from(c.children).find((x) => x.localName === "v");
+    if (v && t === "e") out.special[k] = v.textContent;
+    else if (v && t === "b") out.special[k] = v.textContent === "1" ? "TRUE" : "FALSE";
+  }
+  const rng = (t) => { const [a, b] = t.split(":"), p = (x) => { const m = x.match(/^\$?([A-Z]+)\$?(\d+)$/i); return m ? { r: +m[2] - 1, c: colIdx(m[1]) } : null; }, A = p(a), B = p(b || a); return A && B ? { r1: A.r, c1: A.c, r2: B.r, c2: B.c } : null; };
+  for (const cfEl of all("conditionalFormatting")) {
+    const ranges = (cfEl.getAttribute("sqref") || "").trim().split(/\s+/).map(rng).filter(Boolean);
+    if (!ranges.length) continue;
+    for (const rule of Array.from(cfEl.children).filter((k) => k.localName === "cfRule")) {
+      const type = rule.getAttribute("type");
+      if (!["cellIs", "expression", "containsText", "notContainsText", "beginsWith", "endsWith", "containsBlanks", "notContainsBlanks"].includes(type) || rule.getAttribute("dxfId") == null) continue;
+      out.cf.push({ ranges, type, op: rule.getAttribute("operator"), text: rule.getAttribute("text"), dxf: +rule.getAttribute("dxfId"), prio: +rule.getAttribute("priority") || 0, stop: rule.getAttribute("stopIfTrue") === "1", f: Array.from(rule.children).filter((k) => k.localName === "formula").map((x) => x.textContent) });
+    }
+  }
+  __rdrStyleCache.set(key, out);
+  return out;
+}
+
  window.__rdrWorkbookViewerApi={
   ensure:async()=>{await rdrHydrateCachedBooks();return books.length},
   list:()=>books.map((b,i)=>({index:i,name:b.name,path:b.path||b.name,sheetNames:[...b.sheetNames]})),
+  style:async(bookIndex,sheetName)=>{const b=books[Number(bookIndex)];if(!b)return null;const name=sheetName&&b.sheets[sheetName]?sheetName:b.sheetNames[0];try{return await rdrReadSheetStyle(b,name)}catch(e){console.warn("RDR sheet formatting unavailable:",e);return null}},
   sheet:(bookIndex,sheetName)=>{const b=books[Number(bookIndex)];if(!b)return null;const name=sheetName&&b.sheets[sheetName]?sheetName:b.sheetNames[0];const sh=b.sheets[name];return sh?{book:b.name,path:b.path||b.name,name,rows:sh.rows||[],merges:sh.merges||[],comments:sh.comments||[]}:null}
  };
 })();
@@ -7127,8 +7612,587 @@ html{background:#f5f4ee}body{min-width:320px;background:#f5f4ee;color:var(--rdr-
  function colName(n){let s='';for(n++;n>0;n=Math.floor((n-1)/26))s=String.fromCharCode(65+(n-1)%26)+s;return s}
  function sourceFor(host){const k=[host.dataset.key,host.dataset.province,host.dataset.quarter].join('|'),layer=host.dataset.layer||'total';if(layer!=='total'){const h=rd('rdr.import.componentHistory',{})[k]?.[layer]?.source;if(h)return h}return rd('rdr.import.history',{})[k]?.source||null}
  function coveredMap(merges){const skip=new Set(),starts=new Map();for(const m of merges||[]){const rs=m.e.r-m.s.r+1,cs=m.e.c-m.s.c+1;starts.set(`${m.s.r}|${m.s.c}`,{rowSpan:rs,colSpan:cs});for(let r=m.s.r;r<=m.e.r;r++)for(let c=m.s.c;c<=m.e.c;c++)if(r!==m.s.r||c!==m.s.c)skip.add(`${r}|${c}`)}return{skip,starts}}
- function renderGrid(target,sh,scale=1){const rows=sh?.rows||[],merges=sh?.merges||[],comments=sh?.comments||[],maxRows=Math.min(rows.length,500),maxCols=Math.min(60,Math.max(1,...rows.slice(0,maxRows).map(r=>(r||[]).length),...merges.map(m=>m.e.c+1))),{skip,starts}=coveredMap(merges),cm=new Map(comments.map(c=>[`${c.row}|${c.col}`,c.text]));let html='<table class="rdr-sheet-grid"><thead><tr><th class="row-head"></th>';for(let c=0;c<maxCols;c++)html+=`<th>${colName(c)}</th>`;html+='</tr></thead><tbody>';for(let r=0;r<maxRows;r++){html+=`<tr><th class="row-head">${r+1}</th>`;for(let c=0;c<maxCols;c++){const id=`${r}|${c}`;if(skip.has(id))continue;const m=starts.get(id)||{},v=rows[r]?.[c],comment=cm.get(id);html+=`<td${m.rowSpan>1?` rowspan="${m.rowSpan}"`:''}${m.colSpan>1?` colspan="${m.colSpan}"`:''}${comment?` class="has-comment" title="${esc(comment)}"`:''}>${esc(v==null?'':v)}</td>`}html+='</tr>'}html+='</tbody></table>';target.style.setProperty('--rdr-sheet-scale',scale);target.innerHTML=html;return{maxRows,maxCols,totalRows:rows.length}}
- async function renderSheetViewer(host){if(!host||host.dataset.rendering==='1')return;host.dataset.rendering='1';try{const api=window.__rdrWorkbookViewerApi;if(!api){host.innerHTML='<div class="rdr-sheet-empty">Workbook viewer is not available in this build.</div>';return}await api.ensure();const books=api.list();if(!books.length){host.innerHTML='<div class="rdr-sheet-view"><div class="rdr-sheet-empty">No Excel workbook is cached yet.<br>Import the provincial workbook once, and it will be available here in Review.<br><button type="button" id="rdr-sheet-import-now">Open Import / Export</button></div></div>';host.querySelector('#rdr-sheet-import-now').onclick=()=>document.getElementById('rdr-import-launch')?.click();return}const src=sourceFor(host),prev=host.__rdrSheetState||{},srcBook=src?books.find(b=>b.name===src.book):null;let bi=Number.isFinite(prev.bi)?prev.bi:(srcBook?.index??0),book=books.find(b=>b.index===bi)||books[0];let sn=prev.sn&&book.sheetNames.includes(prev.sn)?prev.sn:(src&&src.book===book.name&&book.sheetNames.includes(src.sheet)?src.sheet:(book.sheetNames.includes(host.dataset.quarter)?host.dataset.quarter:book.sheetNames[0]));let scale=prev.scale||1;const sh=api.sheet(book.index,sn);host.__rdrSheetState={bi:book.index,sn,scale};host.innerHTML=`<div class="rdr-sheet-view"><div class="rdr-sheet-head"><div class="left"><label>Workbook<select id="rdr-sheet-book">${books.map(b=>`<option value="${b.index}"${b.index===book.index?' selected':''}>${esc(b.path||b.name)}</option>`).join('')}</select></label><label>Worksheet<select id="rdr-sheet-name">${book.sheetNames.map(n=>`<option${n===sn?' selected':''}>${esc(n)}</option>`).join('')}</select></label></div><div class="right"><button type="button" id="rdr-sheet-source-jump">Jump to reviewed source</button><button type="button" id="rdr-sheet-zoom-out">−</button><span class="rdr-sheet-zoom" id="rdr-sheet-zoom-label">${Math.round(scale*100)}%</span><button type="button" id="rdr-sheet-zoom-in">+</button><button type="button" id="rdr-sheet-import">Import / export</button></div></div><div class="rdr-sheet-source" id="rdr-sheet-source-text">${src?`Reviewed cell source: ${esc(src.book)} / ${esc(src.sheet)}${src.row?` · row ${src.row}`:''}`:'No exact source row is attached to this selection; showing the closest loaded worksheet.'}</div><div class="rdr-sheet-wrap" id="rdr-sheet-grid"></div><div class="rdr-sheet-status" id="rdr-sheet-status"></div></div>`;const grid=host.querySelector('#rdr-sheet-grid'),info=renderGrid(grid,sh,scale);host.querySelector('#rdr-sheet-status').textContent=`${sh.book} · ${sh.name} · ${info.totalRows.toLocaleString()} row(s)${info.totalRows>info.maxRows?' · showing first '+info.maxRows.toLocaleString():''} · merged cells and cell comments are displayed.`;
+   // ---- Excel number formats -------------------------------------------------
+  const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
+    DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  function xlSplitSections(code) {
+    const out = [];
+    let cur = "",
+      q = false;
+    for (let i = 0; i < code.length; i++) {
+      const ch = code[i];
+      if (ch === '"') q = !q;
+      if (ch === ";" && !q) {
+        out.push(cur);
+        cur = "";
+      } else cur += ch;
+    }
+    out.push(cur);
+    return out;
+  }
+  function xlGeneral(n) {
+    if (Number.isInteger(n)) return Math.abs(n) < 1e11 ? String(n) : n.toExponential(5).replace("e+", "E+").replace("e-", "E-");
+    const a = Math.abs(n);
+    if (a >= 1e11 || a < 1e-9) return n.toExponential(5).replace("e+", "E+").replace("e-", "E-");
+    return String(parseFloat(n.toPrecision(10)));
+  }
+  function xlDate(serial, fmt) {
+    const ms = Math.round((serial - 25569) * 86400000),
+      d = new Date(ms),
+      Y = d.getUTCFullYear(),
+      M = d.getUTCMonth(),
+      D = d.getUTCDate(),
+      W = d.getUTCDay();
+    let h = d.getUTCHours(),
+      mi = d.getUTCMinutes(),
+      s = d.getUTCSeconds();
+    const ampm = /AM\/PM|A\/P/i.test(fmt),
+      p2 = (v) => String(v).padStart(2, "0");
+    const toks = [];
+    const re = /\[h+\]|\[m+\]|\[s+\]|"[^"]*"|\\.|AM\/PM|A\/P|y{1,4}|m{1,5}|d{1,4}|h{1,2}|s{1,2}|\.0+|[^ymdhsAa\\"[]+|./gi;
+    let m;
+    while ((m = re.exec(fmt))) toks.push(m[0]);
+    let out = "";
+    toks.forEach((t, i) => {
+      const L = t.toLowerCase();
+      if (/^"/.test(t)) out += t.slice(1, -1);
+      else if (/^\\/.test(t)) out += t.slice(1);
+      else if (/^y/.test(L)) out += L.length <= 2 ? p2(Y % 100) : String(Y);
+      else if (/^m/.test(L)) {
+        const prev = toks.slice(0, i).reverse().find((x) => /^[hs]/i.test(x) || /^\[h/i.test(x)),
+          next = toks.slice(i + 1).find((x) => /^[hsdy]/i.test(x) && !/^"/.test(x)),
+          minute = (prev && /^(h|\[h)/i.test(prev)) || (next && /^s/i.test(next) && !(prev && /^d|^y/i.test(prev)));
+        if (minute) out += L.length === 1 ? String(mi) : p2(mi);
+        else out += L.length === 1 ? String(M + 1) : L.length === 2 ? p2(M + 1) : L.length === 3 ? MONTHS[M].slice(0, 3) : L.length === 4 ? MONTHS[M] : MONTHS[M][0];
+      } else if (/^d/.test(L)) out += L.length === 1 ? String(D) : L.length === 2 ? p2(D) : L.length === 3 ? DAYS[W].slice(0, 3) : DAYS[W];
+      else if (/^h/.test(L)) {
+        let hh = h;
+        if (ampm) hh = h % 12 || 12;
+        out += L.length === 1 ? String(hh) : p2(hh);
+      } else if (/^s/.test(L)) out += L.length === 1 ? String(s) : p2(s);
+      else if (/^am\/pm|^a\/p/i.test(t)) out += h >= 12 ? (/^a\/p/i.test(t) ? "P" : "PM") : /^a\/p/i.test(t) ? "A" : "AM";
+      else if (/^\[h/i.test(t)) out += String(Math.floor(serial * 24));
+      else if (/^\[m/i.test(t)) out += String(Math.floor(serial * 1440));
+      else if (/^\[s/i.test(t)) out += String(Math.floor(serial * 86400));
+      else out += t;
+    });
+    return out;
+  }
+  function xlNumber(abs, fmt, neg) {
+    // fmt: one section, already stripped of colour/condition tokens
+    let pct = (fmt.match(/%/g) || []).length;
+    let v = abs * Math.pow(100, pct ? 1 : 0);
+    // pull out literals so only placeholders remain in `pat`
+    const lits = [];
+    let pat = "";
+    for (let i = 0; i < fmt.length; i++) {
+      const ch = fmt[i];
+      if (ch === '"') {
+        const j = fmt.indexOf('"', i + 1);
+        lits.push(fmt.slice(i + 1, j < 0 ? fmt.length : j));
+        pat += "\u0001";
+        i = j < 0 ? fmt.length : j;
+      } else if (ch === "\\") {
+        lits.push(fmt[i + 1] || "");
+        pat += "\u0001";
+        i++;
+      } else if (ch === "_") {
+        lits.push(" ");
+        pat += "\u0001";
+        i++;
+      } else if (ch === "*") i++;
+      else pat += ch;
+    }
+    const sci = /[0#?]E[+-]/i.test(pat);
+    const m = pat.match(/[#0?,]*[0#?](?:\.[0#?]*)?(?:E[+-][0]+)?|\.[0#?]+/i);
+    if (!m) return neg ? "-" + pat.replace(/\u0001/g, () => lits.shift()) : pat.replace(/\u0001/g, () => lits.shift());
+    let body = m[0],
+      exp = null;
+    const em = body.match(/E([+-])(0+)/i);
+    if (em) {
+      exp = em;
+      body = body.slice(0, em.index);
+    }
+    const [ip = "", dp = ""] = body.split(".");
+    const comma = /,/.test(ip.replace(/,+$/, "")) && /[0#?],[0#?]/.test(ip);
+    let scale = (ip.match(/,+$/) || [""])[0].length;
+    v = v / Math.pow(1000, scale);
+    const minInt = (ip.replace(/,/g, "").match(/0/g) || []).length,
+      zeros = (dp.match(/0/g) || []).length,
+      maxDec = dp.length;
+    let text;
+    if (sci) {
+      const digitsBefore = ip.replace(/,/g, "").length || 1;
+      let e = v === 0 ? 0 : Math.floor(Math.log10(v)) - (digitsBefore - 1);
+      let mant = v / Math.pow(10, e);
+      let ms = mant.toFixed(maxDec);
+      if (parseFloat(ms) >= Math.pow(10, digitsBefore)) { e += 1; ms = (mant / 10).toFixed(maxDec); }
+      text = ms + "E" + (e < 0 ? "-" : em[1] === "+" ? "+" : "") + String(Math.abs(e)).padStart(em[2].length, "0");
+    } else {
+      let s = v.toFixed(maxDec);
+      let [i0, d0 = ""] = s.split(".");
+      while (d0.length > zeros && d0.endsWith("0")) d0 = d0.slice(0, -1);
+      if (i0.length < minInt) i0 = i0.padStart(minInt, "0");
+      if (minInt === 0 && /^0+$/.test(i0) && d0) i0 = "";
+      else if (minInt === 0 && /^0+$/.test(i0)) i0 = "";
+      if (comma) i0 = i0.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+      text = i0 + (d0 ? "." + d0 : "") ;
+      if (!text) text = zeros || minInt ? "0" : "";
+    }
+    let out = pat.slice(0, m.index) + text + pat.slice(m.index + m[0].length);
+    out = out.replace(/\u0001/g, () => lits.shift());
+    out = out.replace(/%/g, "%");
+    return (neg ? "-" : "") + out;
+  }
+  function xlFormat(v, code) {
+    if (v == null || v === "") return "";
+    if (typeof v !== "number") return String(v);
+    code = code || "General";
+    if (/^general$/i.test(code)) return xlGeneral(v);
+    const secs = xlSplitSections(code);
+    const clean = (s) => s.replace(/\[(?:Red|Black|Blue|Cyan|Green|Magenta|White|Yellow|Color\s*\d+)\]/gi, "").replace(/\[\$[^\]]*-[0-9A-Fa-f]+\]/g, (t) => (t.match(/\$([^\]-]*)/) || ["", ""])[1]).replace(/\[[<>=][^\]]*\]/g, "");
+    let sec, neg = false;
+    if (v < 0 && secs.length >= 2) sec = secs[1];
+    else if (v === 0 && secs.length >= 3) sec = secs[2];
+    else {
+      sec = secs[0];
+      neg = v < 0;
+    }
+    sec = clean(sec);
+    if (/^\s*@\s*$/.test(sec)) return xlGeneral(v);
+    const bare = sec.replace(/"[^"]*"/g, "").replace(/\\./g, "").replace(/\[[^\]]*\]/g, (t) => (/^\[(h+|m+|s+)\]$/i.test(t) ? "h" : ""));
+    if (/[ymdhs]/i.test(bare.replace(/AM\/PM|A\/P/gi, "h")) && !/[0#]/.test(bare.replace(/[ymdhs.]/gi, ""))) return xlDate(Math.abs(v), sec);
+    if (/\?\/|#\s\?\/\?/.test(sec)) return xlGeneral(v);
+    return xlNumber(Math.abs(v), sec, neg);
+  }
+
+  // ---- conditional formatting (rules from the workbook, evaluated on cached cell values) ----
+  class XlErr {
+    constructor(code) {
+      this.code = code;
+    }
+  }
+  const xlTokCache = new Map();
+  function xlTokenize(src) {
+    const toks = [],
+      re = /\s*(?:("(?:[^"]|"")*")|((?:'[^']+'|[A-Za-z0-9_]+)!)|(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|(\$?[A-Za-z]{1,3}\$?\d+)(?![A-Za-z0-9_(])|([A-Za-z_][A-Za-z0-9_.]*)|(<>|<=|>=|[=<>+\-*\/^&%:,()]))/gy;
+    let m;
+    re.lastIndex = 0;
+    while (re.lastIndex < src.length && (m = re.exec(src))) {
+      if (m[1] != null) toks.push({ t: "str", v: m[1].slice(1, -1).replace(/""/g, '"') });
+      else if (m[2] != null) toks.push({ t: "sheet" });
+      else if (m[3] != null) toks.push({ t: "num", v: Number(m[3]) });
+      else if (m[4] != null) {
+        const q = m[4].match(/^(\$?)([A-Za-z]{1,3})(\$?)(\d+)$/);
+        toks.push({ t: "ref", cAbs: !!q[1], c: xlColNum(q[2].toUpperCase()), rAbs: !!q[3], r: +q[4] - 1 });
+      } else if (m[5] != null) toks.push({ t: "name", v: m[5].toUpperCase() });
+      else toks.push({ t: "op", v: m[6] });
+    }
+    if (re.lastIndex < src.replace(/\s+$/, "").length) throw new Error("bad formula");
+    return toks;
+  }
+  function xlColNum(s) {
+    let c = 0;
+    for (const ch of s) c = c * 26 + ch.charCodeAt(0) - 64;
+    return c - 1;
+  }
+  function xlParse(src) {
+    if (xlTokCache.has(src)) return xlTokCache.get(src);
+    const toks = xlTokenize(src);
+    let i = 0;
+    const peek = () => toks[i],
+      isOp = (v) => toks[i] && toks[i].t === "op" && toks[i].v === v,
+      take = () => toks[i++];
+    function cmp() {
+      let l = concat();
+      while (peek() && peek().t === "op" && ["=", "<>", "<", ">", "<=", ">="].includes(peek().v)) l = { k: "bin", o: take().v, a: l, b: concat() };
+      return l;
+    }
+    function concat() {
+      let l = add();
+      while (isOp("&")) {
+        take();
+        l = { k: "bin", o: "&", a: l, b: add() };
+      }
+      return l;
+    }
+    function add() {
+      let l = mul();
+      while (isOp("+") || isOp("-")) l = { k: "bin", o: take().v, a: l, b: mul() };
+      return l;
+    }
+    function mul() {
+      let l = pow();
+      while (isOp("*") || isOp("/")) l = { k: "bin", o: take().v, a: l, b: pow() };
+      return l;
+    }
+    function pow() {
+      let l = unary();
+      while (isOp("^")) {
+        take();
+        l = { k: "bin", o: "^", a: l, b: unary() };
+      }
+      return l;
+    }
+    function unary() {
+      if (isOp("-")) {
+        take();
+        return { k: "neg", a: unary() };
+      }
+      if (isOp("+")) {
+        take();
+        return unary();
+      }
+      let p = primary();
+      while (isOp("%")) {
+        take();
+        p = { k: "pct", a: p };
+      }
+      return p;
+    }
+    function primary() {
+      const t = take();
+      if (!t) throw new Error("unexpected end");
+      if (t.t === "num") return { k: "num", v: t.v };
+      if (t.t === "str") return { k: "str", v: t.v };
+      if (t.t === "op" && t.v === "(") {
+        const e = cmp();
+        if (!isOp(")")) throw new Error("missing )");
+        take();
+        return e;
+      }
+      if (t.t === "sheet" || t.t === "ref") {
+        let foreign = false,
+          a = t;
+        if (t.t === "sheet") {
+          foreign = true;
+          a = take();
+        }
+        if (!a || a.t !== "ref") throw new Error("bad ref");
+        if (isOp(":")) {
+          take();
+          const b = take();
+          if (!b || b.t !== "ref") throw new Error("bad range");
+          return { k: "range", a, b, foreign };
+        }
+        return { k: "ref", a, foreign };
+      }
+      if (t.t === "name") {
+        if (isOp("(")) {
+          take();
+          const args = [];
+          if (!isOp(")")) {
+            for (;;) {
+              args.push(cmp());
+              if (isOp(",")) take();
+              else break;
+            }
+          }
+          if (!isOp(")")) throw new Error("missing )");
+          take();
+          return { k: "call", n: t.v, args };
+        }
+        if (t.v === "TRUE") return { k: "bool", v: true };
+        if (t.v === "FALSE") return { k: "bool", v: false };
+      }
+      throw new Error("unsupported token");
+    }
+    const ast = cmp();
+    if (i < toks.length) throw new Error("trailing tokens");
+    xlTokCache.set(src, ast);
+    return ast;
+  }
+  function xlEval(node, ctx) {
+    const at = (a) => ({ r: a.rAbs ? a.r : a.r + ctx.dr, c: a.cAbs ? a.c : a.c + ctx.dc });
+    const scalar = (x) => (x && x.range ? (x.cells.length ? x.cells[0] : null) : x);
+    const chk = (x) => {
+      if (x instanceof XlErr) throw x;
+      return x;
+    };
+    const n = (x) => {
+      x = chk(scalar(x));
+      if (x == null || x === "") return 0;
+      if (typeof x === "boolean") return x ? 1 : 0;
+      if (typeof x === "number") return x;
+      const v = Number(String(x).trim());
+      if (!Number.isFinite(v)) throw new XlErr("#VALUE!");
+      return v;
+    };
+    const s = (x) => {
+      x = chk(scalar(x));
+      return x == null ? "" : typeof x === "boolean" ? (x ? "TRUE" : "FALSE") : String(x);
+    };
+    const truthy = (x) => {
+      x = chk(scalar(x));
+      return typeof x === "boolean" ? x : typeof x === "number" ? x !== 0 : typeof x === "string" ? x.toUpperCase() === "TRUE" : false;
+    };
+    const flat = (args) => {
+      const out = [];
+      for (const a of args) {
+        const v = xlEval(a, ctx);
+        if (v && v.range) out.push(...v.cells);
+        else out.push(v);
+      }
+      return out;
+    };
+    switch (node.k) {
+      case "num":
+      case "str":
+      case "bool":
+        return node.v;
+      case "ref": {
+        if (node.foreign) return null;
+        const p = at(node.a);
+        return ctx.val(p.r, p.c);
+      }
+      case "range": {
+        if (node.foreign) return { range: true, cells: [] };
+        const A = at(node.a),
+          B = at(node.b),
+          cells = [];
+        for (let r = Math.min(A.r, B.r); r <= Math.max(A.r, B.r); r++) for (let c = Math.min(A.c, B.c); c <= Math.max(A.c, B.c); c++) cells.push(ctx.val(r, c));
+        return { range: true, cells };
+      }
+      case "neg":
+        return -n(xlEval(node.a, ctx));
+      case "pct":
+        return n(xlEval(node.a, ctx)) / 100;
+      case "bin": {
+        const a = xlEval(node.a, ctx),
+          b = xlEval(node.b, ctx);
+        switch (node.o) {
+          case "+": return n(a) + n(b);
+          case "-": return n(a) - n(b);
+          case "*": return n(a) * n(b);
+          case "/": {
+            const d = n(b);
+            if (d === 0) throw new XlErr("#DIV/0!");
+            return n(a) / d;
+          }
+          case "^": return Math.pow(n(a), n(b));
+          case "&": return s(a) + s(b);
+          default: return xlCompare(chk(scalar(a)), chk(scalar(b)), node.o);
+        }
+      }
+      case "call": {
+        const A = node.args,
+          ev = (k) => xlEval(A[k], ctx);
+        switch (node.n) {
+          case "IF": return truthy(ev(0)) ? (A[1] ? ev(1) : true) : A[2] ? ev(2) : false;
+          case "AND": return flat(A).filter((v) => v != null && typeof v !== "string").every((v) => truthy(v));
+          case "OR": return flat(A).filter((v) => v != null && typeof v !== "string").some((v) => truthy(v));
+          case "NOT": return !truthy(ev(0));
+          case "ISBLANK": { const v = scalar(ev(0)); return v == null || v === ""  && false; }
+          case "ISNUMBER": return typeof scalar(ev(0)) === "number";
+          case "ISTEXT": return typeof scalar(ev(0)) === "string";
+          case "ISERROR": try { const v = scalar(ev(0)); return v instanceof XlErr; } catch (e) { return true; }
+          case "SEARCH": case "FIND": {
+            const f = s(ev(0)),
+              w = s(ev(1)),
+              idx = node.n === "SEARCH" ? w.toLowerCase().indexOf(f.toLowerCase()) : w.indexOf(f);
+            if (idx < 0) throw new XlErr("#VALUE!");
+            return idx + 1;
+          }
+          case "LEN": return s(ev(0)).length;
+          case "TRIM": return s(ev(0)).replace(/\s+/g, " ").trim();
+          case "UPPER": return s(ev(0)).toUpperCase();
+          case "LOWER": return s(ev(0)).toLowerCase();
+          case "ABS": return Math.abs(n(ev(0)));
+          case "ROUND": { const d = A[1] ? n(ev(1)) : 0, k = Math.pow(10, d), x = n(ev(0)); return Math.sign(x) * Math.round(Math.abs(x) * k + 1e-9) / k; }
+          case "SUM": return flat(A).reduce((t, v) => t + (typeof v === "number" ? v : 0), 0);
+          case "COUNT": return flat(A).filter((v) => typeof v === "number").length;
+          case "COUNTA": return flat(A).filter((v) => v != null && v !== "").length;
+          case "COUNTBLANK": return flat(A).filter((v) => v == null || v === "").length;
+          case "MAX": { const x = flat(A).filter((v) => typeof v === "number"); return x.length ? Math.max(...x) : 0; }
+          case "MIN": { const x = flat(A).filter((v) => typeof v === "number"); return x.length ? Math.min(...x) : 0; }
+          case "AVERAGE": { const x = flat(A).filter((v) => typeof v === "number"); if (!x.length) throw new XlErr("#DIV/0!"); return x.reduce((a, b) => a + b, 0) / x.length; }
+          default: throw new Error("unsupported function " + node.n);
+        }
+      }
+    }
+    throw new Error("bad node");
+  }
+  function xlCompare(a, b, op) {
+    const rank = (v) => (typeof v === "number" ? 0 : typeof v === "string" ? 1 : 2);
+    if (a == null && b == null) a = b = 0;
+    else if (a == null) a = typeof b === "string" ? "" : typeof b === "boolean" ? false : 0;
+    else if (b == null) b = typeof a === "string" ? "" : typeof a === "boolean" ? false : 0;
+    let d;
+    if (rank(a) !== rank(b)) d = rank(a) - rank(b);
+    else if (typeof a === "string") {
+      const x = a.toLowerCase(),
+        y = b.toLowerCase();
+      d = x < y ? -1 : x > y ? 1 : 0;
+    } else d = Number(a) - Number(b);
+    switch (op) {
+      case "=": case "equal": return d === 0;
+      case "<>": case "notEqual": return d !== 0;
+      case "<": case "lessThan": return d < 0;
+      case ">": case "greaterThan": return d > 0;
+      case "<=": case "lessThanOrEqual": return d <= 0;
+      case ">=": case "greaterThanOrEqual": return d >= 0;
+    }
+    return false;
+  }
+  function xlCondMap(st, rows, special, maxRows, maxCols) {
+    const out = new Map();
+    if (!st.cf || !st.cf.length) return out;
+    const val = (r, c) => {
+      const k = r + "|" + c;
+      if (special[k] != null && /^#/.test(special[k])) return new XlErr(special[k]);
+      if (special[k] != null) return special[k] === "TRUE";
+      const v = rows[r]?.[c];
+      return v === undefined ? null : v;
+    };
+    const rules = [...st.cf].sort((a, b) => a.prio - b.prio);
+    const hit = new Map();
+    for (const rule of rules) {
+      const ar = rule.ranges[0],
+        dx = st.dxfs[rule.dxf];
+      if (!dx) continue;
+      for (const g of rule.ranges)
+        for (let r = g.r1; r <= Math.min(g.r2, maxRows - 1); r++)
+          for (let c = g.c1; c <= Math.min(g.c2, maxCols - 1); c++) {
+            const key = r + "|" + c,
+              cur = hit.get(key);
+            if (cur && cur.stop) continue;
+            let ok = false;
+            try {
+              const ctx = { val, dr: r - ar.r1, dc: c - ar.c1 },
+                ev = (f) => xlEval(xlParse(f), ctx);
+              if (rule.type === "cellIs") {
+                const v = val(r, c);
+                if (v instanceof XlErr) ok = false;
+                else if (rule.op === "between") ok = xlCompare(v, ev(rule.f[0]), ">=") && xlCompare(v, ev(rule.f[1]), "<=");
+                else if (rule.op === "notBetween") ok = xlCompare(v, ev(rule.f[0]), "<") || xlCompare(v, ev(rule.f[1]), ">");
+                else ok = xlCompare(v, ev(rule.f[0]), rule.op);
+              } else if (rule.type === "containsBlanks") ok = String(val(r, c) ?? "").trim() === "";
+              else if (rule.type === "notContainsBlanks") ok = String(val(r, c) ?? "").trim() !== "";
+              else if (rule.f[0]) {
+                const res = ev(rule.f[0]),
+                  x = res && res.range ? res.cells[0] : res;
+                ok = typeof x === "boolean" ? x : typeof x === "number" ? x !== 0 : false;
+              }
+            } catch (e) {
+              ok = false;
+            }
+            if (!ok) continue;
+            const m = cur || { stop: false };
+            for (const k of ["b", "i", "u", "strike", "color", "bg"]) if (dx[k] !== undefined && m[k] === undefined) m[k] = dx[k];
+            if (rule.stop) m.stop = true;
+            hit.set(key, m);
+          }
+    }
+    for (const [k, m] of hit) {
+      const css = [];
+      if (m.color) css.push("color:" + m.color);
+      if (m.bg) css.push("background-color:" + m.bg);
+      if (m.b !== undefined) css.push("font-weight:" + (m.b ? 700 : 400));
+      if (m.i !== undefined) css.push("font-style:" + (m.i ? "italic" : "normal"));
+      if (m.u || m.strike) css.push("text-decoration:" + [m.u ? "underline" : "", m.strike ? "line-through" : ""].filter(Boolean).join(" "));
+      out.set(k, { css: css.join(";"), bg: !!m.bg });
+    }
+    return out;
+  }
+
+  // ---- styled grid --------------------------------------------------------------
+  function xlColWidths(st, maxCols) {
+    const px = new Array(maxCols).fill(st.defaultColPx),
+      hid = new Array(maxCols).fill(false),
+      sty = new Array(maxCols).fill(null);
+    for (const c of st.cols) for (let i = c.min; i <= Math.min(c.max, maxCols - 1); i++) {
+      if (c.px != null) px[i] = c.px;
+      if (c.hidden) hid[i] = true;
+      if (c.s != null) sty[i] = c.s;
+    }
+    return { px, hid, sty };
+  }
+  function renderGridStyled(target, sh, scale, st) {
+    const rows = sh?.rows || [],
+      merges = sh?.merges || [],
+      comments = sh?.comments || [],
+      maxRows = Math.min(Math.max(rows.length, 1), 500),
+      maxCols = Math.min(60, Math.max(1, ...rows.slice(0, maxRows).map((r) => (r || []).length), ...merges.map((m) => m.e.c + 1))),
+      { skip, starts } = coveredMap(merges),
+      cm = new Map(comments.map((c) => [`${c.row}|${c.col}`, c.text])),
+      cond = xlCondMap(st, rows, st.special, maxRows, maxCols),
+      xfs = st.xfs,
+      base = xfs[0] || { css: "", fmt: "General", b: {} },
+      cw = xlColWidths(st, maxCols),
+      sOf = (r, c) => {
+        const k = r + "|" + c;
+        if (st.cells[k] != null) return st.cells[k];
+        const rs = st.rows[r]?.s;
+        if (rs != null) return rs;
+        return cw.sty[c] != null ? cw.sty[c] : 0;
+      },
+      xf = (r, c) => xfs[sOf(r, c)] || base,
+      explicit = (r, c, side) => !!xf(r, c).b?.[side],
+      filled = (r, c) => !!xf(r, c).fill || !!cond.get(r + "|" + c)?.bg,
+      total = cw.px.reduce((a, b, i) => a + (cw.hid[i] ? 0 : b), 0) + 48,
+      GRID = "1px solid #d4d4d4";
+    let html = `<table class="rdr-sheet-grid styled" style="width:${total}px;table-layout:fixed;${base.css}"><colgroup><col style="width:48px">`;
+    for (let c = 0; c < maxCols; c++) html += `<col style="width:${cw.px[c]}px;${cw.hid[c] ? "visibility:collapse;" : ""}">`;
+    html += '</colgroup><thead><tr><th class="row-head"></th>';
+    for (let c = 0; c < maxCols; c++) html += `<th>${colName(c)}</th>`;
+    html += "</tr></thead><tbody>";
+    for (let r = 0; r < maxRows; r++) {
+      const ri = st.rows[r] || {},
+        h = ri.h != null ? ri.h : st.defaultRowPx;
+      html += `<tr style="height:${h}px${ri.hidden ? ";display:none" : ""}"><th class="row-head" style="height:${h}px">${r + 1}</th>`;
+      for (let c = 0; c < maxCols; c++) {
+        const id = `${r}|${c}`;
+        if (skip.has(id)) continue;
+        const m = starts.get(id) || {},
+          rs = m.rowSpan || 1,
+          cs = m.colSpan || 1,
+          x = xf(r, c),
+          raw = rows[r]?.[c],
+          sp = st.special[id],
+          isNum = typeof raw === "number",
+          text = sp != null ? sp : xlFormat(raw, x.fmt),
+          comment = cm.get(id),
+          rEdge = r + rs - 1,
+          cEdge = c + cs - 1,
+          bd = [];
+        // borders: top/left from the first cell, bottom/right from the far edge of a merged block
+        const side = (name, rr, cc, nr, nc) => {
+          if (explicit(rr, cc, name)) return xf(rr, cc).b[name];
+          const nb = name === "r" ? "l" : name === "b" ? "t" : null;
+          if (nb && nr != null && explicit(nr, nc, nb)) return "none";
+          return null;
+        };
+        const t = explicit(r, c, "t") ? x.b.t : null,
+          l = explicit(r, c, "l") ? x.b.l : null,
+          b = side("b", rEdge, c, rEdge + 1, c),
+          rt = side("r", r, cEdge, r, cEdge + 1);
+        if (t) bd.push("border-top:" + t);
+        if (l) bd.push("border-left:" + l);
+        if (b && b !== "none") bd.push("border-bottom:" + b);
+        if (rt && rt !== "none") bd.push("border-right:" + rt);
+        if (st.showGrid) {
+          if (!b && !filled(rEdge, c) && !(rEdge + 1 < maxRows && filled(rEdge + 1, c)) ) bd.push("border-bottom:" + GRID);
+          if (!rt && !filled(r, cEdge) && !(cEdge + 1 < maxCols && filled(r, cEdge + 1))) bd.push("border-right:" + GRID);
+        }
+        const next = rows[r]?.[c + 1],
+          spill = typeof raw === "string" && !x.wrap && x.ha !== "center" && x.ha !== "right" && cs === 1 && (next == null || next === "") && !skip.has(`${r}|${c + 1}`);
+        const align = x.ha === "general" ? (isNum || sp === "TRUE" || sp === "FALSE" ? "text-align:right" : "") : "";
+        const wrap = x.wrap ? "white-space:pre-wrap;word-break:break-word" : "white-space:nowrap";
+        const cls = comment ? ' class="has-comment"' : "";
+        const inner = x.rot === 90 ? `<span style="display:inline-block;writing-mode:vertical-rl;transform:rotate(180deg)">${esc(text)}</span>` : esc(text);
+        html += `<td${rs > 1 ? ` rowspan="${rs}"` : ""}${cs > 1 ? ` colspan="${cs}"` : ""}${cls}${comment ? ` title="${esc(comment)}"` : ""} style="${x.css};${align};${wrap};${spill ? "overflow:visible;position:relative;z-index:1" : "overflow:hidden"};${bd.join(";")};${cond.get(id)?.css || ""}">${inner}</td>`;
+      }
+      html += "</tr>";
+    }
+    html += "</tbody></table>";
+    target.style.setProperty("--rdr-sheet-scale", scale);
+    target.innerHTML = html;
+    return { maxRows, maxCols, totalRows: rows.length };
+  }
+
+  function renderGrid(target,sh,scale,st){if(st&&st.xfs&&st.xfs.length){try{return renderGridStyled(target,sh,scale,st)}catch(e){console.warn("RDR styled grid failed, using plain grid:",e)}}return renderGridPlain(target,sh,scale)}
+  function renderGridPlain(target,sh,scale=1){const rows=sh?.rows||[],merges=sh?.merges||[],comments=sh?.comments||[],maxRows=Math.min(rows.length,500),maxCols=Math.min(60,Math.max(1,...rows.slice(0,maxRows).map(r=>(r||[]).length),...merges.map(m=>m.e.c+1))),{skip,starts}=coveredMap(merges),cm=new Map(comments.map(c=>[`${c.row}|${c.col}`,c.text]));let html='<table class="rdr-sheet-grid"><thead><tr><th class="row-head"></th>';for(let c=0;c<maxCols;c++)html+=`<th>${colName(c)}</th>`;html+='</tr></thead><tbody>';for(let r=0;r<maxRows;r++){html+=`<tr><th class="row-head">${r+1}</th>`;for(let c=0;c<maxCols;c++){const id=`${r}|${c}`;if(skip.has(id))continue;const m=starts.get(id)||{},v=rows[r]?.[c],comment=cm.get(id);html+=`<td${m.rowSpan>1?` rowspan="${m.rowSpan}"`:''}${m.colSpan>1?` colspan="${m.colSpan}"`:''}${comment?` class="has-comment" title="${esc(comment)}"`:''}>${esc(v==null?'':v)}</td>`}html+='</tr>'}html+='</tbody></table>';target.style.setProperty('--rdr-sheet-scale',scale);target.innerHTML=html;return{maxRows,maxCols,totalRows:rows.length}}
+ async function renderSheetViewer(host){if(!host||host.dataset.rendering==='1')return;host.dataset.rendering='1';try{const api=window.__rdrWorkbookViewerApi;if(!api){host.innerHTML='<div class="rdr-sheet-empty">Workbook viewer is not available in this build.</div>';return}await api.ensure();const books=api.list();if(!books.length){host.innerHTML='<div class="rdr-sheet-view"><div class="rdr-sheet-empty">No Excel workbook is cached yet.<br>Import the provincial workbook once, and it will be available here in Review.<br><button type="button" id="rdr-sheet-import-now">Open Import / Export</button></div></div>';host.querySelector('#rdr-sheet-import-now').onclick=()=>document.getElementById('rdr-import-launch')?.click();return}const src=sourceFor(host),prev=host.__rdrSheetState||{},srcBook=src?books.find(b=>b.name===src.book):null;let bi=Number.isFinite(prev.bi)?prev.bi:(srcBook?.index??0),book=books.find(b=>b.index===bi)||books[0];let sn=prev.sn&&book.sheetNames.includes(prev.sn)?prev.sn:(src&&src.book===book.name&&book.sheetNames.includes(src.sheet)?src.sheet:(book.sheetNames.includes(host.dataset.quarter)?host.dataset.quarter:book.sheetNames[0]));let scale=prev.scale||1;const sh=api.sheet(book.index,sn),st=api.style?await api.style(book.index,sn):null;host.__rdrSheetState={bi:book.index,sn,scale};host.innerHTML=`<div class="rdr-sheet-view"><div class="rdr-sheet-head"><div class="left"><label>Workbook<select id="rdr-sheet-book">${books.map(b=>`<option value="${b.index}"${b.index===book.index?' selected':''}>${esc(b.path||b.name)}</option>`).join('')}</select></label><label>Worksheet<select id="rdr-sheet-name">${book.sheetNames.map(n=>`<option${n===sn?' selected':''}>${esc(n)}</option>`).join('')}</select></label></div><div class="right"><button type="button" id="rdr-sheet-source-jump">Jump to reviewed source</button><button type="button" id="rdr-sheet-zoom-out">−</button><span class="rdr-sheet-zoom" id="rdr-sheet-zoom-label">${Math.round(scale*100)}%</span><button type="button" id="rdr-sheet-zoom-in">+</button><button type="button" id="rdr-sheet-import">Import / export</button></div></div><div class="rdr-sheet-source" id="rdr-sheet-source-text">${src?`Reviewed cell source: ${esc(src.book)} / ${esc(src.sheet)}${src.row?` · row ${src.row}`:''}`:'No exact source row is attached to this selection; showing the closest loaded worksheet.'}</div><div class="rdr-sheet-wrap" id="rdr-sheet-grid"></div><div class="rdr-sheet-status" id="rdr-sheet-status"></div></div>`;const grid=host.querySelector('#rdr-sheet-grid'),info=renderGrid(grid,sh,scale,st);host.querySelector('#rdr-sheet-status').textContent=`${sh.book} · ${sh.name} · ${info.totalRows.toLocaleString()} row(s)${info.totalRows>info.maxRows?' · showing first '+info.maxRows.toLocaleString():''} · workbook formatting, merged cells and cell comments are displayed.`;
   host.querySelector('#rdr-sheet-book').onchange=e=>{host.__rdrSheetState={bi:+e.target.value,sn:null,scale};renderSheetViewer(host)};host.querySelector('#rdr-sheet-name').onchange=e=>{host.__rdrSheetState={bi:book.index,sn:e.target.value,scale};renderSheetViewer(host)};host.querySelector('#rdr-sheet-import').onclick=()=>document.getElementById('rdr-import-launch')?.click();host.querySelector('#rdr-sheet-source-jump').onclick=()=>{if(!src)return;const b=books.find(x=>x.name===src.book);if(!b)return;host.__rdrSheetState={bi:b.index,sn:b.sheetNames.includes(src.sheet)?src.sheet:b.sheetNames[0],scale};renderSheetViewer(host)};host.querySelector('#rdr-sheet-zoom-out').onclick=()=>{scale=Math.max(.65,Math.round((scale-.1)*10)/10);host.__rdrSheetState.scale=scale;grid.style.setProperty('--rdr-sheet-scale',scale);host.querySelector('#rdr-sheet-zoom-label').textContent=Math.round(scale*100)+'%'};host.querySelector('#rdr-sheet-zoom-in').onclick=()=>{scale=Math.min(1.6,Math.round((scale+.1)*10)/10);host.__rdrSheetState.scale=scale;grid.style.setProperty('--rdr-sheet-scale',scale);host.querySelector('#rdr-sheet-zoom-label').textContent=Math.round(scale*100)+'%'};
  }finally{host.dataset.rendering='0'}}
  let raf=0;function sync(){cancelAnimationFrame(raf);raf=requestAnimationFrame(()=>{const n=document.getElementById('rdr-narrative-host');if(n&&!n.dataset.ready){n.dataset.ready='1';renderNarrative(n)}const s=document.getElementById('rdr-sheet-tab-host');if(s){const sig=[s.dataset.key,s.dataset.province,s.dataset.quarter,s.dataset.layer].join('|');if(s.dataset.sig!==sig){s.dataset.sig=sig;s.__rdrSheetState=null;renderSheetViewer(s)}else if(!s.firstElementChild)renderSheetViewer(s)}document.querySelectorAll('.rdr-output-tabs button').forEach(b=>{if(b.textContent.trim()==='Excel sheet')b.title='View the imported Excel worksheet used by this reviewed record'})})}
@@ -7420,6 +8484,77 @@ window.__rdrReferenceTemplates=Object.freeze({...window.__rdrReferenceTemplates,
  new MutationObserver(()=>{ensureCommodityButton();cleanupLegacyExport()}).observe(document.getElementById('root')||document.body,{childList:true,subtree:true});
  ensureCommodityButton();cleanupLegacyExport();
 })();
+</script>
+<script id="rdr-nir-note-js">
+(function () {
+  /* Shows where NIR figures come from whenever the selected NIR record is computed from the provinces. */
+  var KE = "rdr3.edits";
+  function readJSON(k, d) {
+    try {
+      var v = localStorage.getItem(k);
+      return v == null ? d : JSON.parse(v);
+    } catch (e) {
+      return d;
+    }
+  }
+  function currentKey() {
+    var cid = readJSON("rdr4.cid", "carabao"),
+      subs = readJSON("rdr4.subs", {}),
+      q = readJSON("rdr2.q", "Q3");
+    localStorage.getItem(KE); /* refresh window.__rdrNirInfo */
+    var info = window.__rdrNirInfo || {},
+      suffix = "|NIR|" + q,
+      want = subs[cid] ? cid + ":" + subs[cid] : null;
+    if (want && info[want + suffix]) return want + suffix;
+    if (info[cid + suffix]) return cid + suffix;
+    if (!subs[cid]) {
+      var h = Object.keys(info).filter(function (k) { return k.indexOf(cid + ":") === 0 && k.slice(-suffix.length) === suffix; })[0];
+      return h || null;
+    }
+    return null;
+  }
+  function selectedProvince() {
+    var b = document.querySelector('[role=group][aria-label=Province] button[aria-pressed="true"]');
+    return b ? b.textContent : "";
+  }
+  function render() {
+    var host = document.querySelector('[role=group][aria-label=Province]'),
+      el = document.getElementById("rdr-nir-note");
+    var show = host && /^\s*NIR/.test(selectedProvince()) && document.querySelector('[data-control="commodity-outputs"]');
+    var k = show ? currentKey() : null,
+      inf = k && window.__rdrNirInfo[k];
+    if (!inf) {
+      if (el) el.remove();
+      return;
+    }
+    var text =
+      "NIR is computed from " + inf.have.join(", ") + " (" + inf.have.length + " of " + (inf.have.length + inf.missing.length) + " provinces/cities)." +
+      (inf.missing.length ? " No data yet for " + inf.missing.join(", ") + ", so the regional total is incomplete." : "") +
+      " Values you type here override the computed ones.";
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "rdr-nir-note";
+      el.setAttribute("role", "note");
+      el.style.cssText = "margin:8px 0 0;padding:8px 12px;border-radius:10px;font-size:13px;line-height:1.35;border:1px solid " + "#c9d3b0;background:#f3f6e8;color:#2c3a12";
+      host.parentNode.insertBefore(el, host.nextSibling);
+    }
+    el.style.background = inf.missing.length ? "#fff4df" : "#f3f6e8";
+    el.style.borderColor = inf.missing.length ? "#e4c27a" : "#c9d3b0";
+    if (el.textContent !== text) el.textContent = text;
+  }
+  var t = null;
+  function schedule() {
+    if (t) return; /* throttle: one render per burst of mutations */
+    t = setTimeout(function () {
+      t = null;
+      render();
+    }, 80);
+  }
+  new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["aria-pressed", "class"] });
+  window.addEventListener("storage", schedule);
+  schedule();
+})();
+
 </script>
 </body></html>
 
